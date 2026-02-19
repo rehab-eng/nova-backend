@@ -1,5 +1,6 @@
-﻿export interface Env {
+export interface Env {
   nova_max_db: D1Database;
+  REALTIME: DurableObjectNamespace;
   ALLOWED_ORIGIN?: string;
 }
 
@@ -16,10 +17,13 @@ type DriverRow = {
   id: string;
   name: string;
   phone: string | null;
+  email: string | null;
   secret_code: string | null;
   status: string | null;
   wallet_balance: number | null;
+  store_id: string | null;
   photo_url: string | null;
+  is_active: number | null;
 };
 
 type OrderRow = {
@@ -36,6 +40,7 @@ type OrderRow = {
   delivery_fee: number | null;
   status: string | null;
   created_at: string | null;
+  delivered_at: string | null;
 };
 
 type WalletTxRow = {
@@ -104,6 +109,13 @@ function getString(value: unknown): string | null {
   return trimmed.length ? trimmed : null;
 }
 
+function getEmail(value: unknown): string | null {
+  const email = getString(value)?.toLowerCase();
+  if (!email) return null;
+  if (!email.includes("@") || email.length < 5) return null;
+  return email;
+}
+
 function parseNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   const n = Number(value);
@@ -144,7 +156,9 @@ async function requireDriver(
 ): Promise<DriverRow | null> {
   if (!driverId || !secretCode) return null;
   return await env.nova_max_db
-    .prepare("SELECT * FROM drivers WHERE id = ? AND secret_code = ?")
+    .prepare(
+      "SELECT * FROM drivers WHERE id = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
+    )
     .bind(driverId, secretCode)
     .first<DriverRow>();
 }
@@ -189,6 +203,185 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function broadcastEvent(
+  env: Env,
+  storeId: string,
+  event: Record<string, unknown>
+): Promise<void> {
+  try {
+    const id = env.REALTIME.idFromName(storeId);
+    const stub = env.REALTIME.get(id);
+    await stub.fetch("https://realtime/event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+    });
+  } catch (err) {
+    console.warn("Realtime broadcast failed", err);
+  }
+}
+
+function periodExpr(period: string | null): string {
+  if (period === "weekly") return "%Y-%W";
+  if (period === "monthly") return "%Y-%m";
+  return "%Y-%m-%d";
+}
+
+type RealtimeRole = "admin" | "driver" | "guest";
+
+type ConnectionMeta = {
+  role: RealtimeRole;
+  driverId: string | null;
+};
+
+export class RealtimeRoom {
+  private state: DurableObjectState;
+  private env: Env;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/event") {
+      const payload = await request.json().catch(() => null);
+      if (!payload || typeof payload !== "object") {
+        return new Response("Invalid payload", { status: 400 });
+      }
+      this.broadcast(payload as Record<string, unknown>);
+      return new Response(null, { status: 202 });
+    }
+
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("Expected websocket", { status: 426 });
+    }
+
+    const roleHeader = request.headers.get("X-Role") ?? "guest";
+    const role: RealtimeRole =
+      roleHeader === "admin" || roleHeader === "driver" ? roleHeader : "guest";
+    const driverId = request.headers.get("X-Driver-Id");
+
+    const alreadyOnline = driverId ? this.hasDriverConnection(driverId) : false;
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    this.state.acceptWebSocket(server);
+    const meta: ConnectionMeta = { role, driverId: driverId ?? null };
+    server.serializeAttachment(meta);
+
+    if (driverId && !alreadyOnline) {
+      await this.setDriverStatus(driverId, "online");
+    }
+
+    server.send(
+      JSON.stringify({ type: "connected", role, ts: new Date().toISOString() })
+    );
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    if (typeof message !== "string") return;
+    let payload: { type?: string } | null = null;
+    try {
+      payload = JSON.parse(message) as { type?: string };
+    } catch {
+      payload = null;
+    }
+    if (payload?.type === "ping") {
+      try {
+        ws.send(JSON.stringify({ type: "pong", ts: Date.now() }));
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  webSocketClose(ws: WebSocket): void {
+    void this.handleDisconnect(ws);
+  }
+
+  webSocketError(ws: WebSocket): void {
+    void this.handleDisconnect(ws);
+  }
+
+  private getMeta(ws: WebSocket): ConnectionMeta {
+    const attachment = ws.deserializeAttachment() as ConnectionMeta | undefined;
+    if (
+      attachment &&
+      (attachment.role === "admin" ||
+        attachment.role === "driver" ||
+        attachment.role === "guest")
+    ) {
+      return {
+        role: attachment.role,
+        driverId: attachment.driverId ?? null,
+      };
+    }
+    return { role: "guest", driverId: null };
+  }
+
+  private hasDriverConnection(driverId: string, exclude?: WebSocket): boolean {
+    for (const socket of this.state.getWebSockets()) {
+      if (socket === exclude) continue;
+      const meta = this.getMeta(socket);
+      if (meta.driverId === driverId) return true;
+    }
+    return false;
+  }
+
+  private async handleDisconnect(ws: WebSocket): Promise<void> {
+    const meta = this.getMeta(ws);
+    if (!meta.driverId) return;
+    const stillOnline = this.hasDriverConnection(meta.driverId, ws);
+    if (!stillOnline) {
+      await this.setDriverStatus(meta.driverId, "offline");
+    }
+  }
+
+  private async setDriverStatus(
+    driverId: string,
+    status: "online" | "offline"
+  ): Promise<void> {
+    await this.env.nova_max_db
+      .prepare("UPDATE drivers SET status = ? WHERE id = ?")
+      .bind(status, driverId)
+      .run();
+
+    this.broadcast({
+      type: "driver_status",
+      driver_id: driverId,
+      status,
+      ts: new Date().toISOString(),
+      audience: "admin",
+    });
+  }
+
+  private broadcast(event: Record<string, unknown>): void {
+    const message = JSON.stringify(event);
+    const targetDriver = getString((event as { target_driver_id?: unknown }).target_driver_id);
+    const audience = getString((event as { audience?: unknown }).audience);
+
+    for (const socket of this.state.getWebSockets()) {
+      const meta = this.getMeta(socket);
+      if (audience === "admin" && meta.role !== "admin") continue;
+      if (audience === "driver" && meta.role !== "driver") continue;
+      if (targetDriver && meta.driverId !== targetDriver && meta.role !== "admin") {
+        continue;
+      }
+      try {
+        socket.send(message);
+      } catch {
+        // ignore send failures
+      }
+    }
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -202,6 +395,66 @@ export default {
 
     if (request.method === "GET" && path === "/health") {
       return jsonResponse({ ok: true }, 200, origin);
+    }
+
+    if (request.method === "GET" && path === "/realtime") {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return errorResponse("Expected websocket", 426, origin);
+      }
+
+      const role = getString(url.searchParams.get("role"));
+      if (role !== "admin" && role !== "driver") {
+        return errorResponse("Invalid role", 400, origin);
+      }
+
+      let storeId: string | null = null;
+      let driverId: string | null = null;
+
+      if (role === "admin") {
+        const adminCode =
+          getString(url.searchParams.get("admin_code")) ??
+          getString(request.headers.get("x-admin-code"));
+        if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
+
+        const store = await requireStore(env, null, adminCode);
+        if (!store) return errorResponse("Unauthorized", 401, origin);
+        storeId = store.id;
+      } else {
+        driverId = getString(url.searchParams.get("driver_id"));
+        const secretCode =
+          getString(url.searchParams.get("secret_code")) ??
+          getString(request.headers.get("x-driver-code"));
+        const email =
+          getEmail(url.searchParams.get("email")) ??
+          getEmail(request.headers.get("x-driver-email"));
+
+        if (!driverId || !secretCode || !email) {
+          return errorResponse("Missing driver_id, secret_code, or email", 400, origin);
+        }
+
+        const driver = await requireDriver(env, driverId, secretCode);
+        if (!driver) return errorResponse("Unauthorized", 401, origin);
+        if (!driver.email || driver.email !== email) {
+          return errorResponse("Email mismatch", 401, origin);
+        }
+        storeId = driver.store_id ?? null;
+      }
+
+      if (!storeId) return errorResponse("Missing store_id", 400, origin);
+
+      const id = env.REALTIME.idFromName(storeId);
+      const stub = env.REALTIME.get(id);
+      const headers = new Headers(request.headers);
+      headers.set("X-Role", role);
+      headers.set("X-Store-Id", storeId);
+      if (driverId) headers.set("X-Driver-Id", driverId);
+
+      const realtimeRequest = new Request("https://realtime/connect", {
+        method: "GET",
+        headers,
+      });
+
+      return stub.fetch(realtimeRequest);
     }
 
     if (request.method === "POST" && path === "/stores") {
@@ -246,13 +499,14 @@ export default {
       const storeId = getString(body?.store_id);
       const name = getString(body?.name);
       const phone = getString(body?.phone);
+      const email = getEmail(body?.email);
       const photoUrl = getString(body?.photo_url);
 
       if (!adminCode) {
         return errorResponse("Missing admin_code", 400, origin);
       }
-      if (!name || !phone) {
-        return errorResponse("Missing driver name or phone", 400, origin);
+      if (!name || !phone || !email) {
+        return errorResponse("Missing driver name, phone, or email", 400, origin);
       }
 
       const store = await requireStore(env, storeId, adminCode);
@@ -264,6 +518,12 @@ export default {
         .first<{ id: string }>();
       if (existing) return errorResponse("Driver phone already exists", 409, origin);
 
+      const existingEmail = await env.nova_max_db
+        .prepare("SELECT id FROM drivers WHERE email = ?")
+        .bind(email)
+        .first<{ id: string }>();
+      if (existingEmail) return errorResponse("Driver email already exists", 409, origin);
+
       let lastError: unknown = null;
       for (let i = 0; i < 5; i++) {
         const secretCode = randomCode(6);
@@ -271,15 +531,38 @@ export default {
           const id = crypto.randomUUID();
           await env.nova_max_db
             .prepare(
-              "INSERT INTO drivers (id, name, phone, secret_code, photo_url) VALUES (?, ?, ?, ?, ?)"
+              "INSERT INTO drivers (id, name, phone, email, secret_code, store_id, photo_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
             )
-            .bind(id, name, phone, secretCode, photoUrl)
+            .bind(id, name, phone, email, secretCode, store.id, photoUrl)
             .run();
+
+          await broadcastEvent(env, store.id, {
+            type: "driver_created",
+            driver: {
+              id,
+              name,
+              phone,
+              email,
+              store_id: store.id,
+              photo_url: photoUrl,
+              status: "offline",
+              is_active: 1,
+            },
+            audience: "admin",
+          });
 
           return jsonResponse(
             {
               ok: true,
-              driver: { id, name, phone, secret_code: secretCode, photo_url: photoUrl },
+              driver: {
+                id,
+                name,
+                phone,
+                email,
+                store_id: store.id,
+                secret_code: secretCode,
+                photo_url: photoUrl,
+              },
             },
             201,
             origin
@@ -296,20 +579,54 @@ export default {
       );
     }
 
+    if (request.method === "GET" && path === "/drivers") {
+      const adminCode =
+        getString(url.searchParams.get("admin_code")) ??
+        getString(request.headers.get("x-admin-code"));
+      const activeParam = getString(url.searchParams.get("active"));
+      const limit = parseNumber(url.searchParams.get("limit"));
+
+      if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
+      const store = await requireStore(env, null, adminCode);
+      if (!store) return errorResponse("Unauthorized", 401, origin);
+
+      let sql =
+        "SELECT id, name, phone, email, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE store_id = ?";
+      if (activeParam !== "all") {
+        if (activeParam === "0" || activeParam === "false") {
+          sql += " AND is_active = 0";
+        } else {
+          sql += " AND (is_active = 1 OR is_active IS NULL)";
+        }
+      }
+      sql += " ORDER BY name ASC";
+
+      const safeLimit = Math.min(Math.max(limit ?? 200, 1), 500);
+      sql += " LIMIT ?";
+
+      const result = await env.nova_max_db
+        .prepare(sql)
+        .bind(store.id, safeLimit)
+        .run<DriverRow>();
+
+      return jsonResponse({ ok: true, drivers: result.results ?? [] }, 200, origin);
+    }
+
     if (request.method === "POST" && path === "/drivers/login") {
       const body = await request.json().catch(() => null);
       const phone = getString(body?.phone);
+      const email = getEmail(body?.email);
       const secretCode = getString(body?.secret_code);
 
-      if (!phone || !secretCode) {
-        return errorResponse("Missing phone or secret_code", 400, origin);
+      if (!phone || !email || !secretCode) {
+        return errorResponse("Missing phone, email, or secret_code", 400, origin);
       }
 
       const driver = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, status, wallet_balance, photo_url FROM drivers WHERE phone = ? AND secret_code = ?"
+          "SELECT id, name, phone, email, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE phone = ? AND email = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
         )
-        .bind(phone, secretCode)
+        .bind(phone, email, secretCode)
         .first<DriverRow>();
 
       if (!driver) return errorResponse("Invalid credentials", 401, origin);
@@ -345,6 +662,16 @@ export default {
         .bind(status, driverId)
         .run();
 
+      if (driver.store_id) {
+        await broadcastEvent(env, driver.store_id, {
+          type: "driver_status",
+          driver_id: driverId,
+          status,
+          ts: new Date().toISOString(),
+          audience: "admin",
+        });
+      }
+
       return jsonResponse({ ok: true, driver_id: driverId, status }, 200, origin);
     }
 
@@ -361,14 +688,25 @@ export default {
         getString(request.headers.get("x-driver-code"));
       const photoUrl = getString(body?.photo_url);
       const name = getString(body?.name);
+      const email = getEmail(body?.email);
 
       if (!secretCode) return errorResponse("Missing secret_code", 400, origin);
-      if (!photoUrl && !name) {
+      if (!photoUrl && !name && !email) {
         return errorResponse("Missing profile data", 400, origin);
       }
 
       const driver = await requireDriver(env, driverId, secretCode);
       if (!driver) return errorResponse("Unauthorized", 401, origin);
+
+      if (email && email !== driver.email) {
+        const existingEmail = await env.nova_max_db
+          .prepare("SELECT id FROM drivers WHERE email = ? AND id != ?")
+          .bind(email, driverId)
+          .first<{ id: string }>();
+        if (existingEmail) {
+          return errorResponse("Driver email already exists", 409, origin);
+        }
+      }
 
       const fields: string[] = [];
       const params: unknown[] = [];
@@ -380,6 +718,10 @@ export default {
         fields.push("name = ?");
         params.push(name);
       }
+      if (email) {
+        fields.push("email = ?");
+        params.push(email);
+      }
       params.push(driverId);
 
       await env.nova_max_db
@@ -389,7 +731,7 @@ export default {
 
       const updated = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, status, wallet_balance, photo_url FROM drivers WHERE id = ?"
+          "SELECT id, name, phone, email, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE id = ?"
         )
         .bind(driverId)
         .first<DriverRow>();
@@ -410,7 +752,7 @@ export default {
 
       const driver = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, status, wallet_balance, photo_url FROM drivers WHERE id = ? AND secret_code = ?"
+          "SELECT id, name, phone, email, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE id = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
         )
         .bind(driverId, secretCode)
         .first<DriverRow>();
@@ -436,23 +778,25 @@ export default {
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
       const existing = await env.nova_max_db
-        .prepare("SELECT id FROM drivers WHERE id = ?")
+        .prepare("SELECT id, store_id FROM drivers WHERE id = ?")
         .bind(driverId)
-        .first<{ id: string }>();
+        .first<{ id: string; store_id: string | null }>();
       if (!existing) return errorResponse("Driver not found", 404, origin);
+      if (existing.store_id && existing.store_id !== store.id) {
+        return errorResponse("Unauthorized", 401, origin);
+      }
 
       await env.nova_max_db
-        .prepare("UPDATE orders SET driver_id = NULL WHERE driver_id = ?")
+        .prepare("UPDATE drivers SET is_active = 0, status = 'offline' WHERE id = ?")
         .bind(driverId)
         .run();
-      await env.nova_max_db
-        .prepare("DELETE FROM wallet_transactions WHERE driver_id = ?")
-        .bind(driverId)
-        .run();
-      await env.nova_max_db
-        .prepare("DELETE FROM drivers WHERE id = ?")
-        .bind(driverId)
-        .run();
+
+      await broadcastEvent(env, store.id, {
+        type: "driver_disabled",
+        driver_id: driverId,
+        ts: new Date().toISOString(),
+        audience: "admin",
+      });
 
       return jsonResponse({ ok: true }, 200, origin);
     }
@@ -482,7 +826,7 @@ export default {
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
       const driver = await env.nova_max_db
-        .prepare("SELECT id, wallet_balance FROM drivers WHERE id = ?")
+        .prepare("SELECT id, wallet_balance, store_id FROM drivers WHERE id = ?")
         .bind(driverId)
         .first<DriverRow>();
       if (!driver) return errorResponse("Driver not found", 404, origin);
@@ -505,6 +849,23 @@ export default {
         )
         .bind(txId, driverId, amount, type, method, note)
         .run();
+
+      if (driver.store_id) {
+        await broadcastEvent(env, driver.store_id, {
+          type: "wallet_transaction",
+          driver_id: driverId,
+          balance: next,
+          target_driver_id: driverId,
+          transaction: {
+            id: txId,
+            amount,
+            type,
+            method,
+            note,
+            created_at: new Date().toISOString(),
+          },
+        });
+      }
 
       return jsonResponse({ ok: true, balance: next }, 200, origin);
     }
@@ -545,6 +906,99 @@ export default {
         .run<WalletTxRow>();
 
       return jsonResponse({ ok: true, transactions: result.results ?? [] }, 200, origin);
+    }
+
+    if (request.method === "GET" && path === "/ledger/summary") {
+      const adminCode =
+        getString(url.searchParams.get("admin_code")) ??
+        getString(request.headers.get("x-admin-code"));
+      const period = getString(url.searchParams.get("period"));
+
+      if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
+      const store = await requireStore(env, null, adminCode);
+      if (!store) return errorResponse("Unauthorized", 401, origin);
+
+      const format = periodExpr(period);
+
+      const ordersResult = await env.nova_max_db
+        .prepare(
+          `SELECT strftime('${format}', COALESCE(delivered_at, created_at)) AS period,
+                  COUNT(*) AS trips,
+                  SUM(COALESCE(delivery_fee, 0)) AS delivery_total
+           FROM orders
+           WHERE store_id = ? AND status = 'delivered'
+           GROUP BY period
+           ORDER BY period DESC`
+        )
+        .bind(store.id)
+        .run();
+
+      const walletResult = await env.nova_max_db
+        .prepare(
+          `SELECT strftime('${format}', created_at) AS period,
+                  SUM(CASE WHEN type = 'credit' THEN amount ELSE 0 END) AS credits,
+                  SUM(CASE WHEN type = 'debit' THEN amount ELSE 0 END) AS debits
+           FROM wallet_transactions
+           WHERE driver_id IN (SELECT id FROM drivers WHERE store_id = ?)
+           GROUP BY period
+           ORDER BY period DESC`
+        )
+        .bind(store.id)
+        .run();
+
+      return jsonResponse(
+        {
+          ok: true,
+          period: period ?? "daily",
+          orders: ordersResult.results ?? [],
+          wallet: walletResult.results ?? [],
+        },
+        200,
+        origin
+      );
+    }
+
+    if (request.method === "GET" && path === "/ledger/drivers") {
+      const adminCode =
+        getString(url.searchParams.get("admin_code")) ??
+        getString(request.headers.get("x-admin-code"));
+      const period = getString(url.searchParams.get("period"));
+      const driverId = getString(url.searchParams.get("driver_id"));
+
+      if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
+      const store = await requireStore(env, null, adminCode);
+      if (!store) return errorResponse("Unauthorized", 401, origin);
+
+      const format = periodExpr(period);
+      const params: unknown[] = [store.id];
+      let sql =
+        `SELECT d.id AS driver_id,
+                d.name AS driver_name,
+                strftime('${format}', COALESCE(o.delivered_at, o.created_at)) AS period,
+                COUNT(*) AS trips,
+                SUM(COALESCE(o.delivery_fee, 0)) AS delivery_total
+         FROM orders o
+         JOIN drivers d ON o.driver_id = d.id
+         WHERE d.store_id = ? AND o.status = 'delivered'`;
+
+      if (driverId) {
+        sql += " AND d.id = ?";
+        params.push(driverId);
+      }
+
+      sql += " GROUP BY d.id, period ORDER BY period DESC, d.name ASC";
+
+      const result = await env.nova_max_db.prepare(sql).bind(...params).run();
+
+      return jsonResponse(
+        {
+          ok: true,
+          period: period ?? "daily",
+          drivers: result.results ?? [],
+        },
+        200,
+        origin
+      );
     }
 
     if (request.method === "GET" && path === "/orders/stream") {
@@ -609,7 +1063,7 @@ export default {
       const customerLocation = getString(body?.customer_location_text);
       const orderType = getString(body?.order_type);
       const receiverName = getString(body?.receiver_name);
-      const payoutMethod = getString(body?.payout_method);
+      const payoutMethod = getString(body?.payout_method) ?? "wallet";
       const price = parseNumber(body?.price);
       const deliveryFee = parseNumber(body?.delivery_fee);
       const productImageUrl: string | null = null;
@@ -646,6 +1100,26 @@ export default {
           "pending"
         )
         .run();
+
+      await broadcastEvent(env, effectiveStoreId, {
+        type: "order_created",
+        target_driver_id: driverId ?? undefined,
+        order: {
+          id: orderId,
+          store_id: effectiveStoreId,
+          driver_id: driverId,
+          customer_name: customerName,
+          customer_location_text: customerLocation,
+          order_type: orderType,
+          receiver_name: receiverName,
+          payout_method: payoutMethod,
+          product_image_url: productImageUrl,
+          price,
+          delivery_fee: deliveryFee,
+          status: "pending",
+          created_at: new Date().toISOString(),
+        },
+      });
 
       return jsonResponse(
         {
@@ -743,24 +1217,61 @@ export default {
         return errorResponse("Order already assigned to another driver", 409, origin);
       }
 
-      await env.nova_max_db
-        .prepare("UPDATE orders SET status = ?, driver_id = ? WHERE id = ?")
-        .bind(nextStatus, effectiveDriverId, orderId)
-        .run();
+      const markDelivered =
+        nextStatus === "delivered" && currentStatus !== "delivered";
 
-      if (
-        nextStatus === "delivered" &&
-        currentStatus !== "delivered" &&
-        effectiveDriverId
-      ) {
+      if (markDelivered) {
+        await env.nova_max_db
+          .prepare(
+            "UPDATE orders SET status = ?, driver_id = ?, delivered_at = CURRENT_TIMESTAMP WHERE id = ?"
+          )
+          .bind(nextStatus, effectiveDriverId, orderId)
+          .run();
+      } else {
+        await env.nova_max_db
+          .prepare("UPDATE orders SET status = ?, driver_id = ? WHERE id = ?")
+          .bind(nextStatus, effectiveDriverId, orderId)
+          .run();
+      }
+
+      if (markDelivered && effectiveDriverId) {
         const fee = typeof order.delivery_fee === "number" ? order.delivery_fee : 0;
         const payoutMethod = order.payout_method ?? "wallet";
-        if (fee > 0 && payoutMethod === "wallet") {
+
+        if (fee > 0) {
           await env.nova_max_db
-            .prepare("UPDATE drivers SET wallet_balance = wallet_balance + ? WHERE id = ?")
+            .prepare(
+              "UPDATE drivers SET wallet_balance = wallet_balance + ? WHERE id = ?"
+            )
             .bind(fee, effectiveDriverId)
             .run();
+
+          const txId = crypto.randomUUID();
+          await env.nova_max_db
+            .prepare(
+              "INSERT INTO wallet_transactions (id, driver_id, amount, type, method, note) VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            .bind(
+              txId,
+              effectiveDriverId,
+              fee,
+              "credit",
+              payoutMethod,
+              `Order ${orderId} delivered`
+            )
+            .run();
         }
+      }
+
+      if (order.store_id) {
+        await broadcastEvent(env, order.store_id, {
+          type: "order_status",
+          order_id: orderId,
+          status: nextStatus,
+          driver_id: effectiveDriverId,
+          target_driver_id: effectiveDriverId ?? undefined,
+          delivered_at: markDelivered ? new Date().toISOString() : order.delivered_at,
+        });
       }
 
       return jsonResponse(
