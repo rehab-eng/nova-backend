@@ -612,6 +612,62 @@ export default {
       return jsonResponse({ ok: true, drivers: result.results ?? [] }, 200, origin);
     }
 
+    if (
+      request.method === "PATCH" &&
+      segments[0] === "drivers" &&
+      segments.length === 3 &&
+      segments[2] === "active"
+    ) {
+      const driverId = segments[1];
+      const body = await request.json().catch(() => null);
+      const adminCode =
+        getString(body?.admin_code) ??
+        getString(request.headers.get("x-admin-code")) ??
+        getString(url.searchParams.get("admin_code"));
+      const activeNum = parseNumber(body?.active);
+      const activeBool =
+        typeof body?.active === "boolean"
+          ? body.active
+          : activeNum !== null
+          ? activeNum !== 0
+          : null;
+
+      if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
+      if (activeBool === null) return errorResponse("Missing active flag", 400, origin);
+
+      const store = await requireStore(env, null, adminCode);
+      if (!store) return errorResponse("Unauthorized", 401, origin);
+
+      const existing = await env.nova_max_db
+        .prepare("SELECT id, store_id FROM drivers WHERE id = ?")
+        .bind(driverId)
+        .first<{ id: string; store_id: string | null }>();
+      if (!existing) return errorResponse("Driver not found", 404, origin);
+      if (existing.store_id && existing.store_id !== store.id) {
+        return errorResponse("Unauthorized", 401, origin);
+      }
+
+      await env.nova_max_db
+        .prepare(
+          "UPDATE drivers SET is_active = ?, status = ? WHERE id = ?"
+        )
+        .bind(activeBool ? 1 : 0, activeBool ? "offline" : "offline", driverId)
+        .run();
+
+      await broadcastEvent(env, store.id, {
+        type: activeBool ? "driver_active" : "driver_disabled",
+        driver_id: driverId,
+        ts: new Date().toISOString(),
+        audience: "admin",
+      });
+
+      return jsonResponse(
+        { ok: true, driver_id: driverId, active: activeBool },
+        200,
+        origin
+      );
+    }
+
     if (request.method === "POST" && path === "/drivers/login") {
       const body = await request.json().catch(() => null);
       const phone = getString(body?.phone);
