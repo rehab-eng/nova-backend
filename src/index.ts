@@ -17,7 +17,6 @@ type DriverRow = {
   id: string;
   name: string;
   phone: string | null;
-  email: string | null;
   secret_code: string | null;
   status: string | null;
   wallet_balance: number | null;
@@ -109,12 +108,6 @@ function getString(value: unknown): string | null {
   return trimmed.length ? trimmed : null;
 }
 
-function getEmail(value: unknown): string | null {
-  const email = getString(value)?.toLowerCase();
-  if (!email) return null;
-  if (!email.includes("@") || email.length < 5) return null;
-  return email;
-}
 
 function parseNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
@@ -424,19 +417,12 @@ export default {
         const secretCode =
           getString(url.searchParams.get("secret_code")) ??
           getString(request.headers.get("x-driver-code"));
-        const email =
-          getEmail(url.searchParams.get("email")) ??
-          getEmail(request.headers.get("x-driver-email"));
-
-        if (!driverId || !secretCode || !email) {
-          return errorResponse("Missing driver_id, secret_code, or email", 400, origin);
+        if (!driverId || !secretCode) {
+          return errorResponse("Missing driver_id or secret_code", 400, origin);
         }
 
         const driver = await requireDriver(env, driverId, secretCode);
         if (!driver) return errorResponse("Unauthorized", 401, origin);
-        if (!driver.email || driver.email !== email) {
-          return errorResponse("Email mismatch", 401, origin);
-        }
         storeId = driver.store_id ?? null;
       }
 
@@ -499,14 +485,13 @@ export default {
       const storeId = getString(body?.store_id);
       const name = getString(body?.name);
       const phone = getString(body?.phone);
-      const email = getEmail(body?.email);
       const photoUrl = getString(body?.photo_url);
 
       if (!adminCode) {
         return errorResponse("Missing admin_code", 400, origin);
       }
-      if (!name || !phone || !email) {
-        return errorResponse("Missing driver name, phone, or email", 400, origin);
+      if (!name || !phone) {
+        return errorResponse("Missing driver name or phone", 400, origin);
       }
 
       const store = await requireStore(env, storeId, adminCode);
@@ -518,12 +503,6 @@ export default {
         .first<{ id: string }>();
       if (existing) return errorResponse("Driver phone already exists", 409, origin);
 
-      const existingEmail = await env.nova_max_db
-        .prepare("SELECT id FROM drivers WHERE email = ?")
-        .bind(email)
-        .first<{ id: string }>();
-      if (existingEmail) return errorResponse("Driver email already exists", 409, origin);
-
       let lastError: unknown = null;
       for (let i = 0; i < 5; i++) {
         const secretCode = randomCode(6);
@@ -531,9 +510,9 @@ export default {
           const id = crypto.randomUUID();
           await env.nova_max_db
             .prepare(
-              "INSERT INTO drivers (id, name, phone, email, secret_code, store_id, photo_url, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)"
+              "INSERT INTO drivers (id, name, phone, secret_code, store_id, photo_url, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)"
             )
-            .bind(id, name, phone, email, secretCode, store.id, photoUrl)
+            .bind(id, name, phone, secretCode, store.id, photoUrl)
             .run();
 
           await broadcastEvent(env, store.id, {
@@ -542,7 +521,6 @@ export default {
               id,
               name,
               phone,
-              email,
               store_id: store.id,
               photo_url: photoUrl,
               status: "offline",
@@ -558,7 +536,6 @@ export default {
                 id,
                 name,
                 phone,
-                email,
                 store_id: store.id,
                 secret_code: secretCode,
                 photo_url: photoUrl,
@@ -591,7 +568,7 @@ export default {
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
       let sql =
-        "SELECT id, name, phone, email, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE store_id = ?";
+        "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE store_id = ?";
       if (activeParam !== "all") {
         if (activeParam === "0" || activeParam === "false") {
           sql += " AND is_active = 0";
@@ -671,18 +648,17 @@ export default {
     if (request.method === "POST" && path === "/drivers/login") {
       const body = await request.json().catch(() => null);
       const phone = getString(body?.phone);
-      const email = getEmail(body?.email);
       const secretCode = getString(body?.secret_code);
 
-      if (!phone || !email || !secretCode) {
-        return errorResponse("Missing phone, email, or secret_code", 400, origin);
+      if (!phone || !secretCode) {
+        return errorResponse("Missing phone or secret_code", 400, origin);
       }
 
       const driver = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, email, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE phone = ? AND email = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
+          "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE phone = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
         )
-        .bind(phone, email, secretCode)
+        .bind(phone, secretCode)
         .first<DriverRow>();
 
       if (!driver) return errorResponse("Invalid credentials", 401, origin);
@@ -744,25 +720,14 @@ export default {
         getString(request.headers.get("x-driver-code"));
       const photoUrl = getString(body?.photo_url);
       const name = getString(body?.name);
-      const email = getEmail(body?.email);
 
       if (!secretCode) return errorResponse("Missing secret_code", 400, origin);
-      if (!photoUrl && !name && !email) {
+      if (!photoUrl && !name) {
         return errorResponse("Missing profile data", 400, origin);
       }
 
       const driver = await requireDriver(env, driverId, secretCode);
       if (!driver) return errorResponse("Unauthorized", 401, origin);
-
-      if (email && email !== driver.email) {
-        const existingEmail = await env.nova_max_db
-          .prepare("SELECT id FROM drivers WHERE email = ? AND id != ?")
-          .bind(email, driverId)
-          .first<{ id: string }>();
-        if (existingEmail) {
-          return errorResponse("Driver email already exists", 409, origin);
-        }
-      }
 
       const fields: string[] = [];
       const params: unknown[] = [];
@@ -774,10 +739,6 @@ export default {
         fields.push("name = ?");
         params.push(name);
       }
-      if (email) {
-        fields.push("email = ?");
-        params.push(email);
-      }
       params.push(driverId);
 
       await env.nova_max_db
@@ -787,7 +748,7 @@ export default {
 
       const updated = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, email, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE id = ?"
+          "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE id = ?"
         )
         .bind(driverId)
         .first<DriverRow>();
@@ -808,7 +769,7 @@ export default {
 
       const driver = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, email, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE id = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
+          "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE id = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
         )
         .bind(driverId, secretCode)
         .first<DriverRow>();
