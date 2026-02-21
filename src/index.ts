@@ -1,4 +1,4 @@
-export interface Env {
+﻿export interface Env {
   nova_max_db: D1Database;
   REALTIME: DurableObjectNamespace;
   ALLOWED_ORIGIN?: string;
@@ -10,6 +10,7 @@ type StoreRow = {
   id: string;
   name: string;
   admin_code: string | null;
+  store_code: string | null;
   wallet_balance: number | null;
 };
 
@@ -37,6 +38,8 @@ type OrderRow = {
   product_image_url: string | null;
   price: number | null;
   delivery_fee: number | null;
+  cash_amount: number | null;
+  wallet_amount: number | null;
   status: string | null;
   created_at: string | null;
   delivered_at: string | null;
@@ -123,23 +126,81 @@ function randomCode(length = 6): string {
   return code;
 }
 
+
+async function generateStoreCode(env: Env): Promise<string> {
+  for (let i = 0; i < 8; i++) {
+    const code = randomCode(8);
+    const existing = await env.nova_max_db
+      .prepare("SELECT id FROM stores WHERE store_code = ?")
+      .bind(code)
+      .first<{ id: string }>();
+    if (!existing) return code;
+  }
+  throw new Error("Could not allocate store code");
+}
+
+async function generateDriverCode(env: Env): Promise<string> {
+  for (let i = 0; i < 8; i++) {
+    const code = randomCode(6);
+    const existing = await env.nova_max_db
+      .prepare("SELECT id FROM drivers WHERE secret_code = ?")
+      .bind(code)
+      .first<{ id: string }>();
+    if (!existing) return code;
+  }
+  throw new Error("Could not allocate driver code");
+}
+
+async function ensureStoreCode(env: Env, store: StoreRow): Promise<StoreRow> {
+  if (store.store_code) return store;
+  const storeCode = await generateStoreCode(env);
+  await env.nova_max_db
+    .prepare("UPDATE stores SET store_code = ? WHERE id = ?")
+    .bind(storeCode, store.id)
+    .run();
+  return { ...store, store_code: storeCode };
+}
+
+async function requireDriverByCode(
+  env: Env,
+  driverCode: string | null
+): Promise<DriverRow | null> {
+  if (!driverCode) return null;
+  return await env.nova_max_db
+    .prepare(
+      "SELECT * FROM drivers WHERE secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
+    )
+    .bind(driverCode)
+    .first<DriverRow>();
+}
+
+async function resolveDriverKey(env: Env, driverKey: string): Promise<DriverRow | null> {
+  return await env.nova_max_db
+    .prepare("SELECT * FROM drivers WHERE id = ? OR secret_code = ?")
+    .bind(driverKey, driverKey)
+    .first<DriverRow>();
+}
+
 async function requireStore(
   env: Env,
   storeId: string | null,
   adminCode: string | null
 ): Promise<StoreRow | null> {
   if (!adminCode) return null;
+  let store: StoreRow | null = null;
   if (storeId) {
-    return await env.nova_max_db
+    store = await env.nova_max_db
       .prepare("SELECT * FROM stores WHERE id = ? AND admin_code = ?")
       .bind(storeId, adminCode)
       .first<StoreRow>();
+  } else {
+    store = await env.nova_max_db
+      .prepare("SELECT * FROM stores WHERE admin_code = ?")
+      .bind(adminCode)
+      .first<StoreRow>();
   }
-
-  return await env.nova_max_db
-    .prepare("SELECT * FROM stores WHERE admin_code = ?")
-    .bind(adminCode)
-    .first<StoreRow>();
+  if (!store) return null;
+  return await ensureStoreCode(env, store);
 }
 
 async function requireDriver(
@@ -413,17 +474,38 @@ export default {
         if (!store) return errorResponse("Unauthorized", 401, origin);
         storeId = store.id;
       } else {
-        driverId = getString(url.searchParams.get("driver_id"));
-        const secretCode =
+        const driverCode =
+          getString(url.searchParams.get("driver_code")) ??
           getString(url.searchParams.get("secret_code")) ??
           getString(request.headers.get("x-driver-code"));
-        if (!driverId || !secretCode) {
-          return errorResponse("Missing driver_id or secret_code", 400, origin);
+        const driverIdParam = getString(url.searchParams.get("driver_id"));
+
+        if (!driverCode && !driverIdParam) {
+          return errorResponse("Missing driver_code or driver_id", 400, origin);
         }
 
-        const driver = await requireDriver(env, driverId, secretCode);
-        if (!driver) return errorResponse("Unauthorized", 401, origin);
-        storeId = driver.store_id ?? null;
+        let driver: DriverRow | null = null;
+
+        if (driverCode) {
+          driver = await requireDriverByCode(env, driverCode);
+          if (!driver) return errorResponse("Unauthorized", 401, origin);
+          if (driverIdParam && driver.id !== driverIdParam) {
+            return errorResponse("Unauthorized", 401, origin);
+          }
+          driverId = driver.id;
+        } else if (driverIdParam) {
+          const secretCode =
+            getString(url.searchParams.get("secret_code")) ??
+            getString(request.headers.get("x-driver-code"));
+          if (!secretCode) {
+            return errorResponse("Missing driver_code", 400, origin);
+          }
+          driver = await requireDriver(env, driverIdParam, secretCode);
+          if (!driver) return errorResponse("Unauthorized", 401, origin);
+          driverId = driverIdParam;
+        }
+
+        storeId = driver?.store_id ?? null;
       }
 
       if (!storeId) return errorResponse("Missing store_id", 400, origin);
@@ -450,14 +532,15 @@ export default {
 
       const id = crypto.randomUUID();
       const adminCode = randomCode(8);
+      const storeCode = await generateStoreCode(env);
 
       await env.nova_max_db
-        .prepare("INSERT INTO stores (id, name, admin_code) VALUES (?, ?, ?)")
-        .bind(id, name, adminCode)
+        .prepare("INSERT INTO stores (id, name, admin_code, store_code) VALUES (?, ?, ?, ?)")
+        .bind(id, name, adminCode, storeCode)
         .run();
 
       return jsonResponse(
-        { ok: true, store: { id, name, admin_code: adminCode } },
+        { ok: true, store: { id, name, admin_code: adminCode, store_code: storeCode } },
         201,
         origin
       );
@@ -470,13 +553,67 @@ export default {
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
 
       const store = await env.nova_max_db
-        .prepare("SELECT id, name FROM stores WHERE admin_code = ?")
+        .prepare("SELECT * FROM stores WHERE admin_code = ?")
         .bind(adminCode)
-        .first<{ id: string; name: string }>();
+        .first<StoreRow>();
 
       if (!store) return errorResponse("Store not found", 404, origin);
-      return jsonResponse({ ok: true, store }, 200, origin);
+      const ensured = await ensureStoreCode(env, store);
+
+      return jsonResponse(
+        {
+          ok: true,
+          store: {
+            id: ensured.id,
+            name: ensured.name,
+            admin_code: ensured.admin_code,
+            store_code: ensured.store_code,
+          },
+        },
+        200,
+        origin
+      );
+    
+    if (request.method === "DELETE" && segments[0] === "stores" && segments.length === 2) {
+      const storeKey = segments[1];
+      const body = await request.json().catch(() => null);
+      const adminCode =
+        getString(body?.admin_code) ??
+        getString(request.headers.get("x-admin-code")) ??
+        getString(url.searchParams.get("admin_code"));
+
+      if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
+
+      const store = await env.nova_max_db
+        .prepare(
+          "SELECT * FROM stores WHERE (id = ? OR store_code = ?) AND admin_code = ?"
+        )
+        .bind(storeKey, storeKey, adminCode)
+        .first<StoreRow>();
+
+      if (!store) return errorResponse("Store not found", 404, origin);
+
+      const purge = getString(url.searchParams.get("purge")) ?? getString(body?.purge);
+      const shouldPurge = purge === "1" || purge === "true";
+      if (!shouldPurge) {
+        return errorResponse("purge=1 required", 400, origin);
+      }
+
+      await env.nova_max_db.batch([
+        env.nova_max_db
+          .prepare(
+            "DELETE FROM wallet_transactions WHERE driver_id IN (SELECT id FROM drivers WHERE store_id = ?)"
+          )
+          .bind(store.id),
+        env.nova_max_db.prepare("DELETE FROM orders WHERE store_id = ?").bind(store.id),
+        env.nova_max_db.prepare("DELETE FROM drivers WHERE store_id = ?").bind(store.id),
+        env.nova_max_db.prepare("DELETE FROM stores WHERE id = ?").bind(store.id),
+      ]);
+
+      return jsonResponse({ ok: true, purged: true }, 200, origin);
     }
+
+}
 
     if (request.method === "POST" && path === "/drivers") {
       const body = await request.json().catch(() => null);
@@ -503,57 +640,51 @@ export default {
         .first<{ id: string }>();
       if (existing) return errorResponse("Driver phone already exists", 409, origin);
 
-      let lastError: unknown = null;
-      for (let i = 0; i < 5; i++) {
-        const secretCode = randomCode(6);
-        try {
-          const id = crypto.randomUUID();
-          await env.nova_max_db
-            .prepare(
-              "INSERT INTO drivers (id, name, phone, secret_code, store_id, photo_url, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)"
-            )
-            .bind(id, name, phone, secretCode, store.id, photoUrl)
-            .run();
+      try {
+        const secretCode = await generateDriverCode(env);
+        const id = crypto.randomUUID();
 
-          await broadcastEvent(env, store.id, {
-            type: "driver_created",
+        await env.nova_max_db
+          .prepare(
+            "INSERT INTO drivers (id, name, phone, secret_code, store_id, photo_url, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)"
+          )
+          .bind(id, name, phone, secretCode, store.id, photoUrl)
+          .run();
+
+        await broadcastEvent(env, store.id, {
+          type: "driver_created",
+          driver: {
+            id,
+            name,
+            phone,
+            store_id: store.id,
+            photo_url: photoUrl,
+            status: "offline",
+            is_active: 1,
+            driver_code: secretCode,
+          },
+          audience: "admin",
+        });
+
+        return jsonResponse(
+          {
+            ok: true,
             driver: {
               id,
               name,
               phone,
               store_id: store.id,
+              driver_code: secretCode,
+              secret_code: secretCode,
               photo_url: photoUrl,
-              status: "offline",
-              is_active: 1,
             },
-            audience: "admin",
-          });
-
-          return jsonResponse(
-            {
-              ok: true,
-              driver: {
-                id,
-                name,
-                phone,
-                store_id: store.id,
-                secret_code: secretCode,
-                photo_url: photoUrl,
-              },
-            },
-            201,
-            origin
-          );
-        } catch (err) {
-          lastError = err;
-        }
+          },
+          201,
+          origin
+        );
+      } catch {
+        return errorResponse("Could not allocate a unique driver code", 500, origin);
       }
-
-      return errorResponse(
-        "Could not allocate a unique driver code",
-        500,
-        origin
-      );
     }
 
     if (request.method === "GET" && path === "/drivers") {
@@ -568,7 +699,7 @@ export default {
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
       let sql =
-        "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE store_id = ?";
+        "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active, secret_code FROM drivers WHERE store_id = ?";
       if (activeParam !== "all") {
         if (activeParam === "0" || activeParam === "false") {
           sql += " AND is_active = 0";
@@ -586,7 +717,9 @@ export default {
         .bind(store.id, safeLimit)
         .run<DriverRow>();
 
-      return jsonResponse({ ok: true, drivers: result.results ?? [] }, 200, origin);
+      const drivers = (result.results ?? []).map((driver) => ({ ...driver, driver_code: driver.secret_code ?? null }));
+
+      return jsonResponse({ ok: true, drivers }, 200, origin);
     }
 
     if (
@@ -595,7 +728,7 @@ export default {
       segments.length === 3 &&
       segments[2] === "active"
     ) {
-      const driverId = segments[1];
+      const driverKey = segments[1];
       const body = await request.json().catch(() => null);
       const adminCode =
         getString(body?.admin_code) ??
@@ -615,11 +748,9 @@ export default {
       const store = await requireStore(env, null, adminCode);
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
-      const existing = await env.nova_max_db
-        .prepare("SELECT id, store_id FROM drivers WHERE id = ?")
-        .bind(driverId)
-        .first<{ id: string; store_id: string | null }>();
+      const existing = await resolveDriverKey(env, driverKey);
       if (!existing) return errorResponse("Driver not found", 404, origin);
+      const driverId = existing.id;
       if (existing.store_id && existing.store_id !== store.id) {
         return errorResponse("Unauthorized", 401, origin);
       }
@@ -656,7 +787,7 @@ export default {
 
       const driver = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE phone = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
+          "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active, secret_code FROM drivers WHERE phone = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
         )
         .bind(phone, secretCode)
         .first<DriverRow>();
@@ -672,7 +803,7 @@ export default {
       segments.length === 3 &&
       segments[2] === "status"
     ) {
-      const driverId = segments[1];
+      const driverKey = segments[1];
       const body = await request.json().catch(() => null);
       const secretCode =
         getString(body?.secret_code) ??
@@ -794,13 +925,23 @@ export default {
       const store = await requireStore(env, null, adminCode);
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
-      const existing = await env.nova_max_db
-        .prepare("SELECT id, store_id FROM drivers WHERE id = ?")
-        .bind(driverId)
-        .first<{ id: string; store_id: string | null }>();
+      const existing = await resolveDriverKey(env, driverKey);
       if (!existing) return errorResponse("Driver not found", 404, origin);
       if (existing.store_id && existing.store_id !== store.id) {
         return errorResponse("Unauthorized", 401, origin);
+      }
+
+      const purge = getString(url.searchParams.get("purge")) ?? getString(body?.purge);
+      const shouldPurge = purge === "1" || purge === "true";
+
+      if (shouldPurge) {
+        await env.nova_max_db.batch([
+          env.nova_max_db.prepare("DELETE FROM wallet_transactions WHERE driver_id = ?").bind(driverId),
+          env.nova_max_db.prepare("DELETE FROM orders WHERE driver_id = ?").bind(driverId),
+          env.nova_max_db.prepare("DELETE FROM drivers WHERE id = ?").bind(driverId),
+        ]);
+
+        return jsonResponse({ ok: true, purged: true }, 200, origin);
       }
 
       await env.nova_max_db
@@ -941,7 +1082,9 @@ export default {
         .prepare(
           `SELECT strftime('${format}', COALESCE(delivered_at, created_at)) AS period,
                   COUNT(*) AS trips,
-                  SUM(COALESCE(delivery_fee, 0)) AS delivery_total
+                  SUM(COALESCE(delivery_fee, 0)) AS delivery_total,
+                  SUM(COALESCE(cash_amount, 0)) AS cash_total,
+                  SUM(COALESCE(wallet_amount, 0)) AS wallet_total
            FROM orders
            WHERE store_id = ? AND status = 'delivered'
            GROUP BY period
@@ -993,7 +1136,9 @@ export default {
                 d.name AS driver_name,
                 strftime('${format}', COALESCE(o.delivered_at, o.created_at)) AS period,
                 COUNT(*) AS trips,
-                SUM(COALESCE(o.delivery_fee, 0)) AS delivery_total
+                SUM(COALESCE(o.delivery_fee, 0)) AS delivery_total,
+                SUM(COALESCE(o.cash_amount, 0)) AS cash_total,
+                SUM(COALESCE(o.wallet_amount, 0)) AS wallet_total
          FROM orders o
          JOIN drivers d ON o.driver_id = d.id
          WHERE d.store_id = ? AND o.status = 'delivered'`;
@@ -1076,6 +1221,7 @@ export default {
         getString(body?.admin_code) ?? getString(request.headers.get("x-admin-code"));
       const storeId = getString(body?.store_id);
       const driverId = getString(body?.driver_id);
+      const driverCode = getString(body?.driver_code) ?? getString(request.headers.get("x-driver-code"));
       const customerName = getString(body?.customer_name);
       const customerLocation = getString(body?.customer_location_text);
       const orderType = getString(body?.order_type);
@@ -1095,17 +1241,31 @@ export default {
       const store = await requireStore(env, storeId, adminCode);
       if (!store) return errorResponse("Unauthorized", 401, origin);
       const effectiveStoreId = store.id;
+      const storeName = store.name;
+      const storeCode = store.store_code ?? null;
+      let assignedDriverId = driverId;
+      if (driverCode && !assignedDriverId) {
+        const driverByCode = await requireDriverByCode(env, driverCode);
+        if (!driverByCode) return errorResponse("Driver not found", 404, origin);
+        if (driverByCode.store_id && driverByCode.store_id !== effectiveStoreId) {
+          return errorResponse("Driver not in store", 409, origin);
+        }
+        assignedDriverId = driverByCode.id;
+      }
+      const safePrice = typeof price === "number" ? price : 0;
+      const cashAmount = payoutMethod === "cash" ? safePrice : 0;
+      const walletAmount = payoutMethod === "cash" ? 0 : safePrice;
 
       const orderId = crypto.randomUUID();
 
       await env.nova_max_db
         .prepare(
-          "INSERT INTO orders (id, store_id, driver_id, customer_name, customer_location_text, order_type, receiver_name, payout_method, product_image_url, price, delivery_fee, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO orders (id, store_id, driver_id, customer_name, customer_location_text, order_type, receiver_name, payout_method, product_image_url, price, delivery_fee, cash_amount, wallet_amount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(
           orderId,
           effectiveStoreId,
-          driverId,
+          assignedDriverId,
           customerName,
           customerLocation,
           orderType,
@@ -1114,17 +1274,21 @@ export default {
           productImageUrl,
           price,
           deliveryFee,
+          cashAmount,
+          walletAmount,
           "pending"
         )
         .run();
 
       await broadcastEvent(env, effectiveStoreId, {
         type: "order_created",
-        target_driver_id: driverId ?? undefined,
+        target_driver_id: assignedDriverId ?? undefined,
         order: {
           id: orderId,
           store_id: effectiveStoreId,
-          driver_id: driverId,
+          store_name: storeName,
+          store_code: storeCode,
+          driver_id: assignedDriverId,
           customer_name: customerName,
           customer_location_text: customerLocation,
           order_type: orderType,
@@ -1133,6 +1297,8 @@ export default {
           product_image_url: productImageUrl,
           price,
           delivery_fee: deliveryFee,
+          cash_amount: cashAmount,
+          wallet_amount: walletAmount,
           status: "pending",
           created_at: new Date().toISOString(),
         },
@@ -1144,7 +1310,7 @@ export default {
           order: {
             id: orderId,
             store_id: effectiveStoreId,
-            driver_id: driverId,
+            driver_id: assignedDriverId,
             customer_name: customerName,
             customer_location_text: customerLocation,
             order_type: orderType,
@@ -1153,6 +1319,8 @@ export default {
             product_image_url: productImageUrl,
             price,
             delivery_fee: deliveryFee,
+            cash_amount: cashAmount,
+            wallet_amount: walletAmount,
             status: "pending",
           },
         },
@@ -1195,13 +1363,21 @@ export default {
       const storeId = getString(body?.store_id);
       const adminCode =
         getString(body?.admin_code) ?? getString(request.headers.get("x-admin-code"));
-      const driverId =
+      let driverId =
         getString(body?.driver_id) ?? getString(request.headers.get("x-driver-id"));
+      const driverCode =
+        getString(body?.driver_code) ??
+        getString(body?.secret_code) ??
+        getString(request.headers.get("x-driver-code"));
       const secretCode =
         getString(body?.secret_code) ?? getString(request.headers.get("x-driver-code"));
 
       const store = await requireStore(env, storeId, adminCode);
-      const driver = await requireDriver(env, driverId, secretCode);
+      let driver = await requireDriver(env, driverId, secretCode);
+      if (!driver && driverCode) {
+        driver = await requireDriverByCode(env, driverCode);
+        if (driver && !driverId) driverId = driver.id;
+      }
 
       if (!store && !driver) return errorResponse("Unauthorized", 401, origin);
 
@@ -1301,3 +1477,4 @@ export default {
     return errorResponse("Not Found", 404, origin);
   },
 } satisfies ExportedHandler<Env>;
+
