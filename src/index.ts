@@ -22,7 +22,6 @@ type DriverRow = {
   status: string | null;
   wallet_balance: number | null;
   store_id: string | null;
-  photo_url: string | null;
   is_active: number | null;
 };
 
@@ -35,7 +34,6 @@ type OrderRow = {
   order_type: string | null;
   receiver_name: string | null;
   payout_method: string | null;
-  product_image_url: string | null;
   price: number | null;
   delivery_fee: number | null;
   cash_amount: number | null;
@@ -111,6 +109,37 @@ function getString(value: unknown): string | null {
   return trimmed.length ? trimmed : null;
 }
 
+
+const ARABIC_DIGIT_MAP: Record<string, string> = {
+  "\u0660": "0",
+  "\u0661": "1",
+  "\u0662": "2",
+  "\u0663": "3",
+  "\u0664": "4",
+  "\u0665": "5",
+  "\u0666": "6",
+  "\u0667": "7",
+  "\u0668": "8",
+  "\u0669": "9",
+  "\u06f0": "0",
+  "\u06f1": "1",
+  "\u06f2": "2",
+  "\u06f3": "3",
+  "\u06f4": "4",
+  "\u06f5": "5",
+  "\u06f6": "6",
+  "\u06f7": "7",
+  "\u06f8": "8",
+  "\u06f9": "9",
+};
+
+function normalizeDigits(value: string | null): string | null {
+  if (!value) return null;
+  const normalized = value
+    .replace(/[\u0660-\u0669\u06f0-\u06f9]/g, (digit) => ARABIC_DIGIT_MAP[digit] ?? digit)
+    .trim();
+  return normalized.length ? normalized : null;
+}
 
 function parseNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
@@ -622,7 +651,6 @@ export default {
       const storeId = getString(body?.store_id);
       const name = getString(body?.name);
       const phone = getString(body?.phone);
-      const photoUrl = getString(body?.photo_url);
 
       if (!adminCode) {
         return errorResponse("Missing admin_code", 400, origin);
@@ -646,9 +674,9 @@ export default {
 
         await env.nova_max_db
           .prepare(
-            "INSERT INTO drivers (id, name, phone, secret_code, store_id, photo_url, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)"
+            "INSERT INTO drivers (id, name, phone, secret_code, store_id, is_active) VALUES (?, ?, ?, ?, ?, 1)"
           )
-          .bind(id, name, phone, secretCode, store.id, photoUrl)
+          .bind(id, name, phone, secretCode, store.id)
           .run();
 
         await broadcastEvent(env, store.id, {
@@ -658,7 +686,6 @@ export default {
             name,
             phone,
             store_id: store.id,
-            photo_url: photoUrl,
             status: "offline",
             is_active: 1,
             driver_code: secretCode,
@@ -676,7 +703,6 @@ export default {
               store_id: store.id,
               driver_code: secretCode,
               secret_code: secretCode,
-              photo_url: photoUrl,
             },
           },
           201,
@@ -699,7 +725,7 @@ export default {
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
       let sql =
-        "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active, secret_code FROM drivers WHERE store_id = ?";
+        "SELECT id, name, phone, status, wallet_balance, store_id, is_active, secret_code FROM drivers WHERE store_id = ?";
       if (activeParam !== "all") {
         if (activeParam === "0" || activeParam === "false") {
           sql += " AND is_active = 0";
@@ -717,7 +743,10 @@ export default {
         .bind(store.id, safeLimit)
         .run<DriverRow>();
 
-      const drivers = (result.results ?? []).map((driver) => ({ ...driver, driver_code: driver.secret_code ?? null }));
+      const drivers = (result.results ?? []).map((driver) => {
+        const { secret_code, ...rest } = driver as any;
+        return { ...rest, driver_code: secret_code ?? null };
+      });
 
       return jsonResponse({ ok: true, drivers }, 200, origin);
     }
@@ -776,25 +805,33 @@ export default {
       );
     }
 
+
     if (request.method === "POST" && path === "/drivers/login") {
       const body = await request.json().catch(() => null);
-      const phone = getString(body?.phone);
-      const secretCode = getString(body?.secret_code);
+      const phone = normalizeDigits(getString(body?.phone));
+      const secretCode = normalizeDigits(
+        getString(body?.secret_code) ?? getString(body?.driver_code)
+      );
 
       if (!phone || !secretCode) {
-        return errorResponse("Missing phone or secret_code", 400, origin);
+        return errorResponse("Missing phone or driver_code", 400, origin);
       }
 
       const driver = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active, secret_code FROM drivers WHERE phone = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
+          "SELECT id, name, phone, status, wallet_balance, store_id, is_active, secret_code FROM drivers WHERE phone = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
         )
         .bind(phone, secretCode)
         .first<DriverRow>();
 
       if (!driver) return errorResponse("Invalid credentials", 401, origin);
 
-      return jsonResponse({ ok: true, driver }, 200, origin);
+      const { secret_code, ...rest } = driver as any;
+      return jsonResponse(
+        { ok: true, driver: { ...rest, driver_code: secret_code ?? null } },
+        200,
+        origin
+      );
     }
 
     if (
@@ -849,11 +886,10 @@ export default {
       const secretCode =
         getString(body?.secret_code) ??
         getString(request.headers.get("x-driver-code"));
-      const photoUrl = getString(body?.photo_url);
       const name = getString(body?.name);
 
       if (!secretCode) return errorResponse("Missing secret_code", 400, origin);
-      if (!photoUrl && !name) {
+      if (!name) {
         return errorResponse("Missing profile data", 400, origin);
       }
 
@@ -862,10 +898,6 @@ export default {
 
       const fields: string[] = [];
       const params: unknown[] = [];
-      if (photoUrl) {
-        fields.push("photo_url = ?");
-        params.push(photoUrl);
-      }
       if (name) {
         fields.push("name = ?");
         params.push(name);
@@ -879,7 +911,7 @@ export default {
 
       const updated = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE id = ?"
+          "SELECT id, name, phone, status, wallet_balance, store_id, is_active FROM drivers WHERE id = ?"
         )
         .bind(driverId)
         .first<DriverRow>();
@@ -900,7 +932,7 @@ export default {
 
       const driver = await env.nova_max_db
         .prepare(
-          "SELECT id, name, phone, status, wallet_balance, photo_url, store_id, is_active FROM drivers WHERE id = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
+          "SELECT id, name, phone, status, wallet_balance, store_id, is_active FROM drivers WHERE id = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
         )
         .bind(driverId, secretCode)
         .first<DriverRow>();
@@ -1229,7 +1261,6 @@ export default {
       const payoutMethod = getString(body?.payout_method) ?? "wallet";
       const price = parseNumber(body?.price);
       const deliveryFee = parseNumber(body?.delivery_fee);
-      const productImageUrl: string | null = null;
 
       if (!adminCode) {
         return errorResponse("Missing admin_code", 400, origin);
@@ -1260,7 +1291,7 @@ export default {
 
       await env.nova_max_db
         .prepare(
-          "INSERT INTO orders (id, store_id, driver_id, customer_name, customer_location_text, order_type, receiver_name, payout_method, product_image_url, price, delivery_fee, cash_amount, wallet_amount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO orders (id, store_id, driver_id, customer_name, customer_location_text, order_type, receiver_name, payout_method, price, delivery_fee, cash_amount, wallet_amount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(
           orderId,
@@ -1271,7 +1302,6 @@ export default {
           orderType,
           receiverName,
           payoutMethod,
-          productImageUrl,
           price,
           deliveryFee,
           cashAmount,
@@ -1294,7 +1324,6 @@ export default {
           order_type: orderType,
           receiver_name: receiverName,
           payout_method: payoutMethod,
-          product_image_url: productImageUrl,
           price,
           delivery_fee: deliveryFee,
           cash_amount: cashAmount,
@@ -1316,7 +1345,6 @@ export default {
             order_type: orderType,
             receiver_name: receiverName,
             payout_method: payoutMethod,
-            product_image_url: productImageUrl,
             price,
             delivery_fee: deliveryFee,
             cash_amount: cashAmount,
