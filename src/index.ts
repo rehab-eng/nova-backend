@@ -854,6 +854,10 @@ export default {
         return errorResponse("Invalid status", 400, origin);
       }
 
+      const existing = await resolveDriverKey(env, driverKey);
+      if (!existing) return errorResponse("Driver not found", 404, origin);
+      const driverId = existing.id;
+
       const driver = await requireDriver(env, driverId, secretCode);
       if (!driver) return errorResponse("Unauthorized", 401, origin);
 
