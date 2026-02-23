@@ -253,6 +253,7 @@ async function listOrders(
     driverId?: string | null;
     status?: string | null;
     limit?: number | null;
+    unassignedOnly?: boolean | null;
   }
 ): Promise<OrderRow[]> {
   const clauses: string[] = [];
@@ -269,6 +270,9 @@ async function listOrders(
   if (filters.status) {
     clauses.push("status = ?");
     params.push(filters.status);
+  }
+  if (filters.unassignedOnly) {
+    clauses.push("driver_id IS NULL");
   }
 
   let sql = "SELECT * FROM orders";
@@ -304,6 +308,23 @@ async function broadcastEvent(
   }
 }
 
+async function broadcastGlobalEvent(
+  env: Env,
+  event: Record<string, unknown>
+): Promise<void> {
+  try {
+    const id = env.REALTIME.idFromName("global");
+    const stub = env.REALTIME.get(id);
+    await stub.fetch("https://realtime/event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+    });
+  } catch (err) {
+    console.warn("Realtime global broadcast failed", err);
+  }
+}
+
 function periodExpr(period: string | null): string {
   if (period === "weekly") return "%Y-%W";
   if (period === "monthly") return "%Y-%m";
@@ -320,10 +341,26 @@ type ConnectionMeta = {
 export class RealtimeRoom {
   private state: DurableObjectState;
   private env: Env;
+  private busyDrivers = new Set<string>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+  }
+
+  private async refreshDriverBusy(driverId: string): Promise<void> {
+    const active = await this.env.nova_max_db
+      .prepare(
+        "SELECT id FROM orders WHERE driver_id = ? AND status IN ('accepted','delivering') LIMIT 1"
+      )
+      .bind(driverId)
+      .first<{ id: string }>();
+
+    if (active) {
+      this.busyDrivers.add(driverId);
+    } else {
+      this.busyDrivers.delete(driverId);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -358,6 +395,9 @@ export class RealtimeRoom {
 
     if (driverId && !alreadyOnline) {
       await this.setDriverStatus(driverId, "online");
+    }
+    if (driverId) {
+      void this.refreshDriverBusy(driverId);
     }
 
     server.send(
@@ -423,6 +463,7 @@ export class RealtimeRoom {
     const stillOnline = this.hasDriverConnection(meta.driverId, ws);
     if (!stillOnline) {
       await this.setDriverStatus(meta.driverId, "offline");
+      this.busyDrivers.delete(meta.driverId);
     }
   }
 
@@ -448,11 +489,35 @@ export class RealtimeRoom {
     const message = JSON.stringify(event);
     const targetDriver = getString((event as { target_driver_id?: unknown }).target_driver_id);
     const audience = getString((event as { audience?: unknown }).audience);
+    const type = getString((event as { type?: unknown }).type);
+
+    if (type === "order_status") {
+      const driverId = getString((event as { driver_id?: unknown }).driver_id);
+      const status = getString((event as { status?: unknown }).status);
+      if (driverId) {
+        if (status === "accepted" || status === "delivering") {
+          this.busyDrivers.add(driverId);
+        } else if (status === "delivered" || status === "cancelled") {
+          this.busyDrivers.delete(driverId);
+        }
+      }
+    }
+
+    const filterBusyDrivers =
+      type === "order_created" && audience === "driver" && !targetDriver;
 
     for (const socket of this.state.getWebSockets()) {
       const meta = this.getMeta(socket);
       if (audience === "admin" && meta.role !== "admin") continue;
       if (audience === "driver" && meta.role !== "driver") continue;
+      if (
+        filterBusyDrivers &&
+        meta.role === "driver" &&
+        meta.driverId &&
+        this.busyDrivers.has(meta.driverId)
+      ) {
+        continue;
+      }
       if (targetDriver && meta.driverId !== targetDriver && meta.role !== "admin") {
         continue;
       }
@@ -490,7 +555,7 @@ export default {
         return errorResponse("Invalid role", 400, origin);
       }
 
-      let storeId: string | null = null;
+      let roomName: string | null = null;
       let driverId: string | null = null;
 
       if (role === "admin") {
@@ -501,7 +566,7 @@ export default {
 
         const store = await requireStore(env, null, adminCode);
         if (!store) return errorResponse("Unauthorized", 401, origin);
-        storeId = store.id;
+        roomName = store.id;
       } else {
         const driverCode =
           getString(url.searchParams.get("driver_code")) ??
@@ -534,16 +599,16 @@ export default {
           driverId = driverIdParam;
         }
 
-        storeId = driver?.store_id ?? null;
+        roomName = "global";
       }
 
-      if (!storeId) return errorResponse("Missing store_id", 400, origin);
+      if (!roomName) return errorResponse("Missing room", 400, origin);
 
-      const id = env.REALTIME.idFromName(storeId);
+      const id = env.REALTIME.idFromName(roomName);
       const stub = env.REALTIME.get(id);
       const headers = new Headers(request.headers);
       headers.set("X-Role", role);
-      headers.set("X-Store-Id", storeId);
+      headers.set("X-Store-Id", roomName);
       if (driverId) headers.set("X-Driver-Id", driverId);
 
       const realtimeRequest = new Request("https://realtime/connect", {
@@ -711,6 +776,40 @@ export default {
       } catch {
         return errorResponse("Could not allocate a unique driver code", 500, origin);
       }
+    }
+
+    if (request.method === "GET" && path === "/drivers/search") {
+      const adminCode =
+        getString(url.searchParams.get("admin_code")) ??
+        getString(request.headers.get("x-admin-code"));
+      const query = getString(url.searchParams.get("query"));
+      const onlineParam = getString(url.searchParams.get("online"));
+
+      if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
+      const store = await requireStore(env, null, adminCode);
+      if (!store) return errorResponse("Unauthorized", 401, origin);
+
+      if (!query) return jsonResponse({ ok: true, drivers: [] }, 200, origin);
+
+      const like = `%${query}%`;
+      let sql =
+        "SELECT id, name, phone, status, is_active, secret_code FROM drivers WHERE (name LIKE ? OR phone LIKE ? OR secret_code LIKE ?)";
+      if (onlineParam === "1" || onlineParam === "true") {
+        sql += " AND status = 'online' AND (is_active = 1 OR is_active IS NULL)";
+      }
+      sql += " ORDER BY status DESC, name ASC LIMIT 25";
+
+      const result = await env.nova_max_db
+        .prepare(sql)
+        .bind(like, like, like)
+        .run<DriverRow>();
+
+      const drivers = (result.results ?? []).map((driver) => {
+        const { secret_code, ...rest } = driver as any;
+        return { ...rest, driver_code: secret_code ?? null };
+      });
+
+      return jsonResponse({ ok: true, drivers }, 200, origin);
     }
 
     if (request.method === "GET" && path === "/drivers") {
@@ -1282,9 +1381,6 @@ export default {
       if (driverCode && !assignedDriverId) {
         const driverByCode = await requireDriverByCode(env, driverCode);
         if (!driverByCode) return errorResponse("Driver not found", 404, origin);
-        if (driverByCode.store_id && driverByCode.store_id !== effectiveStoreId) {
-          return errorResponse("Driver not in store", 409, origin);
-        }
         assignedDriverId = driverByCode.id;
       }
       const safePrice = typeof price === "number" ? price : 0;
@@ -1337,6 +1433,30 @@ export default {
         },
       });
 
+      await broadcastGlobalEvent(env, {
+        type: "order_created",
+        audience: "driver",
+        target_driver_id: assignedDriverId ?? undefined,
+        order: {
+          id: orderId,
+          store_id: effectiveStoreId,
+          store_name: storeName,
+          store_code: storeCode,
+          driver_id: assignedDriverId,
+          customer_name: customerName,
+          customer_location_text: customerLocation,
+          order_type: orderType,
+          receiver_name: receiverName,
+          payout_method: payoutMethod,
+          price,
+          delivery_fee: deliveryFee,
+          cash_amount: cashAmount,
+          wallet_amount: walletAmount,
+          status: "pending",
+          created_at: new Date().toISOString(),
+        },
+      });
+
       return jsonResponse(
         {
           ok: true,
@@ -1367,11 +1487,31 @@ export default {
       const driverId = getString(url.searchParams.get("driver_id"));
       const status = getString(url.searchParams.get("status"));
       const limit = parseNumber(url.searchParams.get("limit"));
+      const driverCode =
+        getString(url.searchParams.get("driver_code")) ??
+        getString(request.headers.get("x-driver-code"));
 
       if (!storeId && adminCode) {
         const store = await requireStore(env, null, adminCode);
         if (!store) return errorResponse("Unauthorized", 401, origin);
         storeId = store.id;
+      }
+
+      if (!storeId && !adminCode && !driverId) {
+        if (!driverCode) {
+          return errorResponse("store_id or driver_id required", 400, origin);
+        }
+        const driver = await requireDriverByCode(env, driverCode);
+        if (!driver) return errorResponse("Unauthorized", 401, origin);
+        if (status && status !== "pending") {
+          return errorResponse("Invalid status", 400, origin);
+        }
+        const orders = await listOrders(env, {
+          status: "pending",
+          limit,
+          unassignedOnly: true,
+        });
+        return jsonResponse({ ok: true, orders }, 200, origin);
       }
 
       const orders = await listOrders(env, { storeId, driverId, status, limit });
@@ -1445,7 +1585,18 @@ export default {
       const markDelivered =
         nextStatus === "delivered" && currentStatus !== "delivered";
 
-      if (markDelivered) {
+      if (currentStatus === "pending" && nextStatus === "accepted") {
+        const update = await env.nova_max_db
+          .prepare(
+            "UPDATE orders SET status = ?, driver_id = ? WHERE id = ? AND status = 'pending' AND (driver_id IS NULL OR driver_id = ?)"
+          )
+          .bind(nextStatus, effectiveDriverId, orderId, effectiveDriverId)
+          .run();
+
+        if (update.meta.changes === 0) {
+          return errorResponse("Order already assigned to another driver", 409, origin);
+        }
+      } else if (markDelivered) {
         await env.nova_max_db
           .prepare(
             "UPDATE orders SET status = ?, driver_id = ?, delivered_at = CURRENT_TIMESTAMP WHERE id = ?"
@@ -1498,6 +1649,15 @@ export default {
           delivered_at: markDelivered ? new Date().toISOString() : order.delivered_at,
         });
       }
+
+      await broadcastGlobalEvent(env, {
+        type: "order_status",
+        audience: "driver",
+        order_id: orderId,
+        status: nextStatus,
+        driver_id: effectiveDriverId,
+        delivered_at: markDelivered ? new Date().toISOString() : order.delivered_at,
+      });
 
       return jsonResponse(
         { ok: true, order_id: orderId, status: nextStatus },
