@@ -109,6 +109,10 @@ function getString(value: unknown): string | null {
   return trimmed.length ? trimmed : null;
 }
 
+function getNormalized(value: unknown): string | null {
+  return normalizeDigits(getString(value));
+}
+
 
 const ARABIC_DIGIT_MAP: Record<string, string> = {
   "\u0660": "0",
@@ -194,19 +198,21 @@ async function requireDriverByCode(
   env: Env,
   driverCode: string | null
 ): Promise<DriverRow | null> {
-  if (!driverCode) return null;
+  const normalized = normalizeDigits(driverCode);
+  if (!normalized) return null;
   return await env.nova_max_db
     .prepare(
       "SELECT * FROM drivers WHERE secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
     )
-    .bind(driverCode)
+    .bind(normalized)
     .first<DriverRow>();
 }
 
 async function resolveDriverKey(env: Env, driverKey: string): Promise<DriverRow | null> {
+  const normalized = normalizeDigits(driverKey) ?? driverKey;
   return await env.nova_max_db
     .prepare("SELECT * FROM drivers WHERE id = ? OR secret_code = ?")
-    .bind(driverKey, driverKey)
+    .bind(normalized, normalized)
     .first<DriverRow>();
 }
 
@@ -215,17 +221,18 @@ async function requireStore(
   storeId: string | null,
   adminCode: string | null
 ): Promise<StoreRow | null> {
-  if (!adminCode) return null;
+  const normalizedAdmin = normalizeDigits(adminCode);
+  if (!normalizedAdmin) return null;
   let store: StoreRow | null = null;
   if (storeId) {
     store = await env.nova_max_db
       .prepare("SELECT * FROM stores WHERE id = ? AND admin_code = ?")
-      .bind(storeId, adminCode)
+      .bind(storeId, normalizedAdmin)
       .first<StoreRow>();
   } else {
     store = await env.nova_max_db
       .prepare("SELECT * FROM stores WHERE admin_code = ?")
-      .bind(adminCode)
+      .bind(normalizedAdmin)
       .first<StoreRow>();
   }
   if (!store) return null;
@@ -237,12 +244,13 @@ async function requireDriver(
   driverId: string | null,
   secretCode: string | null
 ): Promise<DriverRow | null> {
-  if (!driverId || !secretCode) return null;
+  const normalized = normalizeDigits(secretCode);
+  if (!driverId || !normalized) return null;
   return await env.nova_max_db
     .prepare(
       "SELECT * FROM drivers WHERE id = ? AND secret_code = ? AND (is_active = 1 OR is_active IS NULL)"
     )
-    .bind(driverId, secretCode)
+    .bind(driverId, normalized)
     .first<DriverRow>();
 }
 
@@ -476,6 +484,21 @@ export class RealtimeRoom {
       .bind(status, driverId)
       .run();
 
+    const driver = await this.env.nova_max_db
+      .prepare("SELECT store_id FROM drivers WHERE id = ?")
+      .bind(driverId)
+      .first<{ store_id: string | null }>();
+
+    if (driver?.store_id) {
+      await broadcastEvent(this.env, driver.store_id, {
+        type: "driver_status",
+        driver_id: driverId,
+        status,
+        ts: new Date().toISOString(),
+        audience: "admin",
+      });
+    }
+
     this.broadcast({
       type: "driver_status",
       driver_id: driverId,
@@ -560,8 +583,8 @@ export default {
 
       if (role === "admin") {
         const adminCode =
-          getString(url.searchParams.get("admin_code")) ??
-          getString(request.headers.get("x-admin-code"));
+          getNormalized(url.searchParams.get("admin_code")) ??
+          getNormalized(request.headers.get("x-admin-code"));
         if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
 
         const store = await requireStore(env, null, adminCode);
@@ -569,9 +592,9 @@ export default {
         roomName = store.id;
       } else {
         const driverCode =
-          getString(url.searchParams.get("driver_code")) ??
-          getString(url.searchParams.get("secret_code")) ??
-          getString(request.headers.get("x-driver-code"));
+          getNormalized(url.searchParams.get("driver_code")) ??
+          getNormalized(url.searchParams.get("secret_code")) ??
+          getNormalized(request.headers.get("x-driver-code"));
         const driverIdParam = getString(url.searchParams.get("driver_id"));
 
         if (!driverCode && !driverIdParam) {
@@ -589,8 +612,8 @@ export default {
           driverId = driver.id;
         } else if (driverIdParam) {
           const secretCode =
-            getString(url.searchParams.get("secret_code")) ??
-            getString(request.headers.get("x-driver-code"));
+            getNormalized(url.searchParams.get("secret_code")) ??
+            getNormalized(request.headers.get("x-driver-code"));
           if (!secretCode) {
             return errorResponse("Missing driver_code", 400, origin);
           }
@@ -643,7 +666,8 @@ export default {
     if (request.method === "POST" && path === "/stores/by-admin") {
       const body = await request.json().catch(() => null);
       const adminCode =
-        getString(body?.admin_code) ?? getString(request.headers.get("x-admin-code"));
+        getNormalized(body?.admin_code) ??
+        getNormalized(request.headers.get("x-admin-code"));
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
 
       const store = await env.nova_max_db
@@ -672,9 +696,9 @@ export default {
       const storeKey = segments[1];
       const body = await request.json().catch(() => null);
       const adminCode =
-        getString(body?.admin_code) ??
-        getString(request.headers.get("x-admin-code")) ??
-        getString(url.searchParams.get("admin_code"));
+        getNormalized(body?.admin_code) ??
+        getNormalized(request.headers.get("x-admin-code")) ??
+        getNormalized(url.searchParams.get("admin_code"));
 
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
 
@@ -712,10 +736,11 @@ export default {
     if (request.method === "POST" && path === "/drivers") {
       const body = await request.json().catch(() => null);
       const adminCode =
-        getString(body?.admin_code) ?? getString(request.headers.get("x-admin-code"));
+        getNormalized(body?.admin_code) ??
+        getNormalized(request.headers.get("x-admin-code"));
       const storeId = getString(body?.store_id);
       const name = getString(body?.name);
-      const phone = getString(body?.phone);
+      const phone = normalizeDigits(getString(body?.phone));
 
       if (!adminCode) {
         return errorResponse("Missing admin_code", 400, origin);
@@ -780,9 +805,9 @@ export default {
 
     if (request.method === "GET" && path === "/drivers/search") {
       const adminCode =
-        getString(url.searchParams.get("admin_code")) ??
-        getString(request.headers.get("x-admin-code"));
-      const query = getString(url.searchParams.get("query"));
+        getNormalized(url.searchParams.get("admin_code")) ??
+        getNormalized(request.headers.get("x-admin-code"));
+      const query = getNormalized(url.searchParams.get("query"));
       const onlineParam = getString(url.searchParams.get("online"));
 
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
@@ -814,8 +839,8 @@ export default {
 
     if (request.method === "GET" && path === "/drivers") {
       const adminCode =
-        getString(url.searchParams.get("admin_code")) ??
-        getString(request.headers.get("x-admin-code"));
+        getNormalized(url.searchParams.get("admin_code")) ??
+        getNormalized(request.headers.get("x-admin-code"));
       const activeParam = getString(url.searchParams.get("active"));
       const limit = parseNumber(url.searchParams.get("limit"));
 
@@ -942,8 +967,9 @@ export default {
       const driverKey = segments[1];
       const body = await request.json().catch(() => null);
       const secretCode =
-        getString(body?.secret_code) ??
-        getString(request.headers.get("x-driver-code"));
+        getNormalized(body?.secret_code) ??
+        getNormalized(body?.driver_code) ??
+        getNormalized(request.headers.get("x-driver-code"));
       const status = getString(body?.status);
 
       if (!secretCode || !status) {
@@ -987,8 +1013,9 @@ export default {
       const driverId = segments[1];
       const body = await request.json().catch(() => null);
       const secretCode =
-        getString(body?.secret_code) ??
-        getString(request.headers.get("x-driver-code"));
+        getNormalized(body?.secret_code) ??
+        getNormalized(body?.driver_code) ??
+        getNormalized(request.headers.get("x-driver-code"));
       const name = getString(body?.name);
 
       if (!secretCode) return errorResponse("Missing secret_code", 400, origin);
@@ -1029,8 +1056,8 @@ export default {
     ) {
       const driverId = segments[1];
       const secretCode =
-        getString(url.searchParams.get("secret_code")) ??
-        getString(request.headers.get("x-driver-code"));
+        getNormalized(url.searchParams.get("secret_code")) ??
+        getNormalized(request.headers.get("x-driver-code"));
       if (!secretCode) return errorResponse("Missing secret_code", 400, origin);
 
       const driver = await env.nova_max_db
@@ -1172,11 +1199,11 @@ export default {
     ) {
       const driverId = segments[1];
       const adminCode =
-        getString(url.searchParams.get("admin_code")) ??
-        getString(request.headers.get("x-admin-code"));
+        getNormalized(url.searchParams.get("admin_code")) ??
+        getNormalized(request.headers.get("x-admin-code"));
       const secretCode =
-        getString(url.searchParams.get("secret_code")) ??
-        getString(request.headers.get("x-driver-code"));
+        getNormalized(url.searchParams.get("secret_code")) ??
+        getNormalized(request.headers.get("x-driver-code"));
       const limit = parseNumber(url.searchParams.get("limit"));
 
       let authorized = false;
@@ -1353,10 +1380,13 @@ export default {
     if (request.method === "POST" && path === "/orders") {
       const body = await request.json().catch(() => null);
       const adminCode =
-        getString(body?.admin_code) ?? getString(request.headers.get("x-admin-code"));
+        getNormalized(body?.admin_code) ??
+        getNormalized(request.headers.get("x-admin-code"));
       const storeId = getString(body?.store_id);
       const driverId = getString(body?.driver_id);
-      const driverCode = getString(body?.driver_code) ?? getString(request.headers.get("x-driver-code"));
+      const driverCode =
+        getNormalized(body?.driver_code) ??
+        getNormalized(request.headers.get("x-driver-code"));
       const customerName = getString(body?.customer_name);
       const customerLocation = getString(body?.customer_location_text);
       const orderType = getString(body?.order_type);
@@ -1483,13 +1513,13 @@ export default {
 
     if (request.method === "GET" && path === "/orders") {
       let storeId = getString(url.searchParams.get("store_id"));
-      const adminCode = getString(url.searchParams.get("admin_code"));
+      const adminCode = getNormalized(url.searchParams.get("admin_code"));
       const driverId = getString(url.searchParams.get("driver_id"));
       const status = getString(url.searchParams.get("status"));
       const limit = parseNumber(url.searchParams.get("limit"));
       const driverCode =
-        getString(url.searchParams.get("driver_code")) ??
-        getString(request.headers.get("x-driver-code"));
+        getNormalized(url.searchParams.get("driver_code")) ??
+        getNormalized(request.headers.get("x-driver-code"));
 
       if (!storeId && adminCode) {
         const store = await requireStore(env, null, adminCode);
@@ -1534,15 +1564,17 @@ export default {
 
       const storeId = getString(body?.store_id);
       const adminCode =
-        getString(body?.admin_code) ?? getString(request.headers.get("x-admin-code"));
+        getNormalized(body?.admin_code) ??
+        getNormalized(request.headers.get("x-admin-code"));
       let driverId =
         getString(body?.driver_id) ?? getString(request.headers.get("x-driver-id"));
       const driverCode =
-        getString(body?.driver_code) ??
-        getString(body?.secret_code) ??
-        getString(request.headers.get("x-driver-code"));
+        getNormalized(body?.driver_code) ??
+        getNormalized(body?.secret_code) ??
+        getNormalized(request.headers.get("x-driver-code"));
       const secretCode =
-        getString(body?.secret_code) ?? getString(request.headers.get("x-driver-code"));
+        getNormalized(body?.secret_code) ??
+        getNormalized(request.headers.get("x-driver-code"));
 
       const store = await requireStore(env, storeId, adminCode);
       let driver = await requireDriver(env, driverId, secretCode);
