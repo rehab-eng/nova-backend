@@ -1564,6 +1564,63 @@ export default {
       }
 
       const currentStatus = order.status as OrderStatus;
+      const isReopen = currentStatus === "cancelled" && nextStatus === "pending";
+      if (isReopen) {
+        if (!store) return errorResponse("Unauthorized", 401, origin);
+        if (order.store_id && order.store_id !== store.id) {
+          return errorResponse("Unauthorized", 401, origin);
+        }
+
+        await env.nova_max_db
+          .prepare("UPDATE orders SET status = ?, driver_id = NULL, delivered_at = NULL WHERE id = ?")
+          .bind("pending", orderId)
+          .run();
+
+        const refreshed = await env.nova_max_db
+          .prepare("SELECT * FROM orders WHERE id = ?")
+          .bind(orderId)
+          .first<OrderRow>();
+
+        const payloadOrder = {
+          id: orderId,
+          store_id: store.id,
+          store_name: store.name,
+          store_code: store.store_code ?? null,
+          driver_id: null,
+          customer_name: refreshed?.customer_name ?? order.customer_name,
+          customer_location_text:
+            refreshed?.customer_location_text ?? order.customer_location_text,
+          order_type: refreshed?.order_type ?? order.order_type,
+          receiver_name: refreshed?.receiver_name ?? order.receiver_name,
+          payout_method: refreshed?.payout_method ?? order.payout_method,
+          price: refreshed?.price ?? order.price,
+          delivery_fee: refreshed?.delivery_fee ?? order.delivery_fee,
+          cash_amount: refreshed?.cash_amount ?? order.cash_amount,
+          wallet_amount: refreshed?.wallet_amount ?? order.wallet_amount,
+          status: "pending",
+          created_at: refreshed?.created_at ?? order.created_at ?? new Date().toISOString(),
+        };
+
+        await broadcastEvent(env, store.id, {
+          type: "order_status",
+          order_id: orderId,
+          status: "pending",
+          driver_id: null,
+          delivered_at: null,
+        });
+
+        await broadcastGlobalEvent(env, {
+          type: "order_created",
+          audience: "driver",
+          order: payloadOrder,
+        });
+
+        return jsonResponse(
+          { ok: true, order_id: orderId, status: "pending" },
+          200,
+          origin
+        );
+      }
       if (currentStatus !== nextStatus && !canTransition(currentStatus, nextStatus)) {
         return errorResponse("Invalid status transition", 400, origin);
       }
