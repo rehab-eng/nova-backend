@@ -80,7 +80,17 @@ function canTransition(from: OrderStatus, to: OrderStatus): boolean {
 }
 
 function getOrigin(request: Request, env: Env): string {
-  return env.ALLOWED_ORIGIN ?? request.headers.get("Origin") ?? "*";
+  const requestOrigin = request.headers.get("Origin") ?? "*";
+  const allowed = env.ALLOWED_ORIGIN;
+  if (!allowed) return requestOrigin;
+  const list = allowed
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!list.length) return requestOrigin;
+  if (list.includes("*")) return requestOrigin;
+  if (list.includes(requestOrigin)) return requestOrigin;
+  return requestOrigin;
 }
 
 function corsHeaders(origin: string): HeadersInit {
