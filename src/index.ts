@@ -704,16 +704,16 @@ const handler = {
       if (!name) return errorResponse("Missing store name", 400, origin);
 
       const id = crypto.randomUUID();
-      const adminCode = randomCode(8);
+      const storeAdminCode = randomCode(8);
       const storeCode = await generateStoreCode(env);
 
       await env.nova_max_db
         .prepare("INSERT INTO stores (id, name, admin_code, store_code) VALUES (?, ?, ?, ?)")
-        .bind(id, name, adminCode, storeCode)
+        .bind(id, name, storeAdminCode, storeCode)
         .run();
 
       return jsonResponse(
-        { ok: true, store: { id, name, admin_code: adminCode, store_code: storeCode } },
+        { ok: true, store: { id, name, admin_code: storeAdminCode, store_code: storeCode } },
         201,
         origin
       );
