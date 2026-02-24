@@ -859,12 +859,12 @@ export default {
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
       let sql =
-        "SELECT id, name, phone, status, wallet_balance, store_id, is_active, secret_code FROM drivers WHERE store_id = ?";
+        "SELECT id, name, phone, status, wallet_balance, store_id, is_active, secret_code FROM drivers";
       if (activeParam !== "all") {
         if (activeParam === "0" || activeParam === "false") {
-          sql += " AND is_active = 0";
+          sql += " WHERE is_active = 0";
         } else {
-          sql += " AND (is_active = 1 OR is_active IS NULL)";
+          sql += " WHERE (is_active = 1 OR is_active IS NULL)";
         }
       }
       sql += " ORDER BY name ASC";
@@ -874,7 +874,7 @@ export default {
 
       const result = await env.nova_max_db
         .prepare(sql)
-        .bind(store.id, safeLimit)
+        .bind(safeLimit)
         .run<DriverRow>();
 
       const drivers = (result.results ?? []).map((driver) => {
@@ -911,12 +911,9 @@ export default {
       const store = await requireStore(env, null, adminCode);
       if (!store) return errorResponse("Unauthorized", 401, origin);
 
-      const existing = await resolveDriverKey(env, driverKey);
+      const existing = await resolveDriverKey(env, driverId);
       if (!existing) return errorResponse("Driver not found", 404, origin);
       const driverId = existing.id;
-      if (existing.store_id && existing.store_id !== store.id) {
-        return errorResponse("Unauthorized", 401, origin);
-      }
 
       await env.nova_max_db
         .prepare(
@@ -1099,9 +1096,6 @@ export default {
 
       const existing = await resolveDriverKey(env, driverKey);
       if (!existing) return errorResponse("Driver not found", 404, origin);
-      if (existing.store_id && existing.store_id !== store.id) {
-        return errorResponse("Unauthorized", 401, origin);
-      }
 
       const purge = getString(url.searchParams.get("purge")) ?? getString(body?.purge);
       const shouldPurge = purge === "1" || purge === "true";
