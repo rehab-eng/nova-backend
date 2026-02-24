@@ -1,7 +1,11 @@
-﻿export interface Env {
+﻿import * as Sentry from "@sentry/cloudflare";
+
+export interface Env {
   nova_max_db: D1Database;
   REALTIME: DurableObjectNamespace;
   ALLOWED_ORIGIN?: string;
+  SENTRY_DSN?: string;
+  SENTRY_ENVIRONMENT?: string;
 }
 
 type OrderStatus = "pending" | "accepted" | "delivering" | "delivered" | "cancelled";
@@ -563,7 +567,7 @@ export class RealtimeRoom {
   }
 }
 
-export default {
+const handler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const origin = getOrigin(request, env);
@@ -1762,4 +1766,10 @@ export default {
     return errorResponse("Not Found", 404, origin);
   },
 } satisfies ExportedHandler<Env>;
+
+export default Sentry.withSentry((env: Env) => ({
+  dsn: env.SENTRY_DSN,
+  environment: env.SENTRY_ENVIRONMENT,
+  tracesSampleRate: 0.1,
+}), handler);
 
