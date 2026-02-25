@@ -588,7 +588,7 @@ export class RealtimeRoom {
       ) {
         continue;
       }
-      if (targetDriver && meta.driverId !== targetDriver && meta.role !== "admin") {
+      if (targetDriver && meta.role === "driver" && meta.driverId !== targetDriver) {
         continue;
       }
       try {
