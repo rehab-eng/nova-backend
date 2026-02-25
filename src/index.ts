@@ -193,7 +193,7 @@ function randomCode(length = 6): string {
 
 async function generateStoreCode(env: Env): Promise<string> {
   for (let i = 0; i < 8; i++) {
-    const code = randomCode(8);
+    const code = randomCode(4);
     const existing = await env.nova_max_db
       .prepare("SELECT id FROM stores WHERE store_code = ?")
       .bind(code)
