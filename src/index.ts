@@ -381,7 +381,7 @@ function periodExpr(period: string | null): string {
   return "%Y-%m-%d";
 }
 
-type RealtimeRole = "admin" | "driver" | "guest";
+type RealtimeRole = "admin" | "driver" | "store" | "guest";
 
 type ConnectionMeta = {
   role: RealtimeRole;
@@ -430,7 +430,11 @@ export class RealtimeRoom {
 
     const roleHeader = request.headers.get("X-Role") ?? "guest";
     const role: RealtimeRole =
-      roleHeader === "admin" || roleHeader === "driver" ? roleHeader : "guest";
+      roleHeader === "admin" ||
+      roleHeader === "driver" ||
+      roleHeader === "store"
+        ? roleHeader
+        : "guest";
     const driverId = request.headers.get("X-Driver-Id");
 
     const alreadyOnline = driverId ? this.hasDriverConnection(driverId) : false;
@@ -488,6 +492,7 @@ export class RealtimeRoom {
       attachment &&
       (attachment.role === "admin" ||
         attachment.role === "driver" ||
+        attachment.role === "store" ||
         attachment.role === "guest")
     ) {
       return {
@@ -616,7 +621,7 @@ const handler = {
       }
 
       const role = getString(url.searchParams.get("role"));
-      if (role !== "admin" && role !== "driver") {
+      if (role !== "admin" && role !== "driver" && role !== "store") {
         return errorResponse("Invalid role", 400, origin);
       }
 
@@ -649,6 +654,31 @@ const handler = {
           if (!store) return errorResponse("Unauthorized", 401, origin);
           roomName = store.id;
         }
+      } else if (role === "store") {
+        const storeCode =
+          getNormalized(url.searchParams.get("store_code")) ??
+          getNormalized(url.searchParams.get("code")) ??
+          getNormalized(url.searchParams.get("store"));
+        const storeName =
+          normalizeName(url.searchParams.get("store_name")) ??
+          normalizeName(url.searchParams.get("name"));
+
+        if (!storeCode || !storeName) {
+          return errorResponse("Missing store_code or store_name", 400, origin);
+        }
+
+        const store = await env.nova_max_db
+          .prepare("SELECT * FROM stores WHERE store_code = ? OR id = ?")
+          .bind(storeCode, storeCode)
+          .first<StoreRow>();
+        if (!store) return errorResponse("Store not found", 404, origin);
+
+        const normalizedName = normalizeName(store.name);
+        if (!normalizedName || normalizedName !== storeName) {
+          return errorResponse("Unauthorized", 401, origin);
+        }
+
+        roomName = store.id;
       } else {
         const driverCode =
           getNormalized(url.searchParams.get("driver_code")) ??
