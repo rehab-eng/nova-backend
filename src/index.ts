@@ -166,6 +166,16 @@ function normalizeDigits(value: string | null): string | null {
   return normalized.length ? normalized : null;
 }
 
+function normalizeName(value: unknown): string | null {
+  const raw = getString(value);
+  if (!raw) return null;
+  return raw
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
 function parseNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
   const n = Number(value);
@@ -733,6 +743,58 @@ const handler = {
         .run<StoreRow>();
 
       return jsonResponse({ ok: true, stores: result.results ?? [] }, 200, origin);
+    }
+
+    if (request.method === "GET" && path === "/stores/track") {
+      const storeCode =
+        getNormalized(url.searchParams.get("store_code")) ??
+        getNormalized(url.searchParams.get("code")) ??
+        getNormalized(url.searchParams.get("store"));
+      const storeName =
+        normalizeName(url.searchParams.get("store_name")) ??
+        normalizeName(url.searchParams.get("name"));
+
+      if (!storeCode || !storeName) {
+        return errorResponse("Missing store_code or store_name", 400, origin);
+      }
+
+      const store = await env.nova_max_db
+        .prepare("SELECT id, name, store_code FROM stores WHERE store_code = ? OR id = ?")
+        .bind(storeCode, storeCode)
+        .first<StoreRow>();
+
+      if (!store) return errorResponse("Store not found", 404, origin);
+
+      const normalizedName = normalizeName(store.name);
+      if (!normalizedName || normalizedName !== storeName) {
+        return errorResponse("Unauthorized", 401, origin);
+      }
+
+      const ensured = await ensureStoreCode(env, store);
+      const orders = await listOrders(env, { storeId: ensured.id, limit: 200 });
+      const slim = orders.map((order) => ({
+        id: order.id,
+        status: order.status ?? null,
+        created_at: order.created_at ?? null,
+        delivered_at: order.delivered_at ?? null,
+        customer_name: order.customer_name ?? null,
+        receiver_name: order.receiver_name ?? null,
+        order_type: order.order_type ?? null,
+      }));
+
+      return jsonResponse(
+        {
+          ok: true,
+          store: {
+            id: ensured.id,
+            name: ensured.name,
+            store_code: ensured.store_code,
+          },
+          orders: slim,
+        },
+        200,
+        origin
+      );
     }
 
     if (request.method === "POST" && path === "/stores/by-admin") {
