@@ -33,8 +33,13 @@ type DriverRow = {
 type OrderRow = {
   id: string;
   store_id: string | null;
+  store_name?: string | null;
+  store_code?: string | null;
   driver_id: string | null;
+  driver_name?: string | null;
+  driver_phone?: string | null;
   customer_name: string | null;
+  customer_phone: string | null;
   customer_location_text: string | null;
   order_type: string | null;
   receiver_name: string | null;
@@ -46,6 +51,9 @@ type OrderRow = {
   status: string | null;
   created_at: string | null;
   delivered_at: string | null;
+  cancelled_at: string | null;
+  cancel_reason: string | null;
+  cancelled_by: string | null;
 };
 
 type WalletTxRow = {
@@ -55,6 +63,20 @@ type WalletTxRow = {
   type: "credit" | "debit" | string;
   method: string | null;
   note: string | null;
+  idempotency_key?: string | null;
+  created_at: string | null;
+};
+
+type StoreWalletTxRow = {
+  id: string;
+  store_id: string;
+  amount: number;
+  type: "credit" | "debit" | string;
+  method: string | null;
+  note: string | null;
+  idempotency_key?: string | null;
+  related_driver_id?: string | null;
+  related_order_id?: string | null;
   created_at: string | null;
 };
 
@@ -119,6 +141,9 @@ function errorResponse(message: string, status: number, origin: string): Respons
 }
 
 function getString(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length ? trimmed : null;
@@ -128,10 +153,39 @@ function getNormalized(value: unknown): string | null {
   return normalizeDigits(getString(value));
 }
 
-function isMasterAdmin(env: Env, adminCode: string | null): boolean {
-  const master = getNormalized(env.ADMIN_MASTER_CODE);
-  if (!master) return false;
-  return getNormalized(adminCode) === master;
+function normalizeAdminCode(value: unknown): string | null {
+  const normalized = normalizeDigits(getString(value));
+  return normalized ? normalized.toLowerCase() : null;
+}
+
+let cachedMasterCode: { value: string | null; ts: number } | null = null;
+const MASTER_CACHE_TTL = 5 * 60 * 1000;
+
+async function getMasterCode(env: Env): Promise<string | null> {
+  const now = Date.now();
+  if (cachedMasterCode && now - cachedMasterCode.ts < MASTER_CACHE_TTL) {
+    return cachedMasterCode.value;
+  }
+  try {
+    const row = await env.nova_max_db
+      .prepare("SELECT value FROM system_settings WHERE key = 'master_code'")
+      .first<{ value: string }>();
+    const value = normalizeAdminCode(row?.value);
+    if (value) {
+      cachedMasterCode = { value, ts: now };
+      return value;
+    }
+  } catch {
+    // ignore
+  }
+  const fromEnv = normalizeAdminCode(env.ADMIN_MASTER_CODE);
+  cachedMasterCode = { value: fromEnv ?? null, ts: now };
+  return fromEnv ?? null;
+}
+
+function isMasterCode(adminCode: string | null, masterCode: string | null): boolean {
+  if (!masterCode) return false;
+  return normalizeAdminCode(adminCode) === masterCode;
 }
 
 
@@ -190,6 +244,131 @@ function randomCode(length = 6): string {
   return code;
 }
 
+function getIdempotencyKey(value: unknown): string | null {
+  const raw = getString(value);
+  if (!raw) return null;
+  return raw.normalize("NFKC").trim();
+}
+
+function isConstraintError(err: unknown): boolean {
+  if (!err) return false;
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message.includes("UNIQUE constraint failed") ||
+    message.includes("SQLITE_CONSTRAINT")
+  );
+}
+
+function buildOrderNote(
+  orderId: string,
+  action: "delivered" | "accepted" | "cancelled",
+  storeName?: string | null
+): string {
+  const base =
+    action === "delivered"
+      ? "تم التسليم"
+      : action === "accepted"
+        ? "تم القبول"
+        : "تم الإلغاء";
+  const suffix = storeName ? ` - ${storeName}` : "";
+  return `طلب ${orderId} ${base}${suffix}`;
+}
+
+async function applyWalletTransaction(params: {
+  env: Env;
+  driverId: string;
+  storeId?: string | null;
+  amount: number;
+  type: "credit" | "debit";
+  method?: string | null;
+  note?: string | null;
+  idempotencyKey: string;
+  relatedOrderId?: string | null;
+}): Promise<
+  | { ok: true; balance: number; storeBalance?: number | null }
+  | { ok: false; error: string; duplicate?: boolean }
+> {
+  const { env, driverId, storeId, amount, type, method, note, idempotencyKey } = params;
+  const driver = await env.nova_max_db
+    .prepare("SELECT id, wallet_balance, store_id FROM drivers WHERE id = ?")
+    .bind(driverId)
+    .first<DriverRow>();
+  if (!driver) return { ok: false, error: "Driver not found" };
+
+  const currentDriver = typeof driver.wallet_balance === "number" ? driver.wallet_balance : 0;
+  const delta = type === "credit" ? amount : -amount;
+  const nextDriver = currentDriver + delta;
+  if (nextDriver < 0) {
+    return { ok: false, error: "Insufficient wallet balance" };
+  }
+
+  let storeBalance: number | null = null;
+  let nextStore: number | null = null;
+  let effectiveStoreId = storeId ?? driver.store_id ?? null;
+  if (effectiveStoreId) {
+    const store = await env.nova_max_db
+      .prepare("SELECT id, wallet_balance FROM stores WHERE id = ?")
+      .bind(effectiveStoreId)
+      .first<StoreRow>();
+    if (store) {
+      storeBalance = typeof store.wallet_balance === "number" ? store.wallet_balance : 0;
+      nextStore = storeBalance - delta;
+    } else {
+      effectiveStoreId = null;
+    }
+  }
+
+  const driverTxId = crypto.randomUUID();
+  const statements = [
+    env.nova_max_db
+      .prepare(
+        "INSERT INTO wallet_transactions (id, driver_id, amount, type, method, note, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      )
+      .bind(driverTxId, driverId, amount, type, method ?? null, note ?? null, idempotencyKey),
+    env.nova_max_db
+      .prepare("UPDATE drivers SET wallet_balance = ? WHERE id = ?")
+      .bind(nextDriver, driverId),
+  ];
+
+  if (effectiveStoreId && nextStore !== null) {
+    const storeTxId = crypto.randomUUID();
+    const storeType = type === "credit" ? "debit" : "credit";
+    statements.push(
+      env.nova_max_db
+        .prepare(
+          "INSERT INTO store_wallet_transactions (id, store_id, amount, type, method, note, idempotency_key, related_driver_id, related_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(
+          storeTxId,
+          effectiveStoreId,
+          amount,
+          storeType,
+          method ?? null,
+          note ?? null,
+          idempotencyKey,
+          driverId,
+          params.relatedOrderId ?? null
+        )
+    );
+    statements.push(
+      env.nova_max_db
+        .prepare("UPDATE stores SET wallet_balance = ? WHERE id = ?")
+        .bind(nextStore, effectiveStoreId)
+    );
+  }
+
+  try {
+    await env.nova_max_db.batch(statements);
+  } catch (err) {
+    if (isConstraintError(err)) {
+      return { ok: false, error: "Database constraint error", duplicate: true };
+    }
+    throw err;
+  }
+
+  return { ok: true, balance: nextDriver, storeBalance: nextStore };
+}
+
 
 async function generateStoreCode(env: Env): Promise<string> {
   for (let i = 0; i < 8; i++) {
@@ -242,8 +421,8 @@ async function requireDriverByCode(
 async function resolveDriverKey(env: Env, driverKey: string): Promise<DriverRow | null> {
   const normalized = normalizeDigits(driverKey) ?? driverKey;
   return await env.nova_max_db
-    .prepare("SELECT * FROM drivers WHERE id = ? OR secret_code = ?")
-    .bind(normalized, normalized)
+    .prepare("SELECT * FROM drivers WHERE id = ? OR secret_code = ? OR phone = ?")
+    .bind(normalized, normalized, normalized)
     .first<DriverRow>();
 }
 
@@ -253,10 +432,9 @@ async function requireStore(
   adminCode: string | null
 ): Promise<StoreRow | null> {
   const normalizedAdmin = normalizeDigits(adminCode);
-  if (!normalizedAdmin) return null;
-  const master = getNormalized(env.ADMIN_MASTER_CODE);
-  const masterOk = master ? normalizedAdmin === master : false;
-  if (master && !masterOk) return null;
+  if (!normalizedAdmin || normalizedAdmin.length < 4) return null;
+  const master = await getMasterCode(env);
+  const masterOk = master ? normalizeAdminCode(normalizedAdmin) === master : false;
   let store: StoreRow | null = null;
   if (storeId) {
     if (masterOk) {
@@ -271,7 +449,7 @@ async function requireStore(
         .first<StoreRow>();
     }
   } else {
-    if (master) return null;
+    if (masterOk) return null;
     store = await env.nova_max_db
       .prepare("SELECT * FROM stores WHERE admin_code = ?")
       .bind(normalizedAdmin)
@@ -310,24 +488,28 @@ async function listOrders(
   const params: unknown[] = [];
 
   if (filters.storeId) {
-    clauses.push("store_id = ?");
+    clauses.push("o.store_id = ?");
     params.push(filters.storeId);
   }
   if (filters.driverId) {
-    clauses.push("driver_id = ?");
+    clauses.push("o.driver_id = ?");
     params.push(filters.driverId);
   }
   if (filters.status) {
-    clauses.push("status = ?");
+    clauses.push("o.status = ?");
     params.push(filters.status);
   }
   if (filters.unassignedOnly) {
-    clauses.push("driver_id IS NULL");
+    clauses.push("o.driver_id IS NULL");
   }
 
-  let sql = "SELECT * FROM orders";
+  let sql =
+    "SELECT o.*, s.name AS store_name, s.store_code AS store_code, d.name AS driver_name, d.phone AS driver_phone " +
+    "FROM orders o " +
+    "LEFT JOIN stores s ON o.store_id = s.id " +
+    "LEFT JOIN drivers d ON o.driver_id = d.id";
   if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
-  sql += " ORDER BY created_at DESC LIMIT ?";
+  sql += " ORDER BY o.created_at DESC LIMIT ?";
 
   const limit = Math.min(Math.max(filters.limit ?? 200, 1), 500);
   params.push(limit);
@@ -375,10 +557,11 @@ async function broadcastGlobalEvent(
   }
 }
 
-function periodExpr(period: string | null): string {
-  if (period === "weekly") return "%Y-%W";
-  if (period === "monthly") return "%Y-%m";
-  return "%Y-%m-%d";
+function periodExpr(period: string | null): { format: string; modifier: string } {
+  if (period === "yearly") return { format: "%Y", modifier: "+0 hours" };
+  if (period === "monthly") return { format: "%Y-%m", modifier: "+0 hours" };
+  if (period === "weekly") return { format: "%Y-%W", modifier: "+2 days" };
+  return { format: "%Y-%m-%d", modifier: "+0 hours" };
 }
 
 type RealtimeRole = "admin" | "driver" | "store" | "guest";
@@ -615,6 +798,17 @@ const handler = {
       return jsonResponse({ ok: true }, 200, origin);
     }
 
+    if (request.method === "GET" && path === "/stores/public") {
+      const result = await env.nova_max_db
+        .prepare("SELECT id, name FROM stores ORDER BY name ASC")
+        .run<StoreRow>();
+      const stores = (result.results ?? []).map((store) => ({
+        id: store.id,
+        name: store.name ?? null,
+      }));
+      return jsonResponse({ ok: true, stores }, 200, origin);
+    }
+
     if (request.method === "GET" && path === "/realtime") {
       if (request.headers.get("Upgrade") !== "websocket") {
         return errorResponse("Expected websocket", 426, origin);
@@ -636,18 +830,22 @@ const handler = {
         const storeKey =
           getString(url.searchParams.get("store_id")) ??
           getString(url.searchParams.get("store_code"));
-        const masterEnabled = Boolean(getNormalized(env.ADMIN_MASTER_CODE));
+        const masterCode = await getMasterCode(env);
+        const masterEnabled = Boolean(masterCode);
 
         if (masterEnabled) {
-          if (!isMasterAdmin(env, adminCode)) {
-            return errorResponse("Unauthorized", 401, origin);
-          }
-          if (storeKey) {
-            const store = await requireStore(env, storeKey, adminCode);
-            if (!store) return errorResponse("Store not found", 404, origin);
-            roomName = store.id;
+          if (isMasterCode(adminCode, masterCode)) {
+            if (storeKey) {
+              const store = await requireStore(env, storeKey, adminCode);
+              if (!store) return errorResponse("Store not found", 404, origin);
+              roomName = store.id;
+            } else {
+              roomName = "global";
+            }
           } else {
-            roomName = "global";
+            const store = await requireStore(env, storeKey ?? null, adminCode);
+            if (!store) return errorResponse("Unauthorized", 401, origin);
+            roomName = store.id;
           }
         } else {
           const store = await requireStore(env, storeKey ?? null, adminCode);
@@ -655,6 +853,7 @@ const handler = {
           roomName = store.id;
         }
       } else if (role === "store") {
+        const storeIdParam = getString(url.searchParams.get("store_id"));
         const storeCode =
           getNormalized(url.searchParams.get("store_code")) ??
           getNormalized(url.searchParams.get("code")) ??
@@ -663,19 +862,20 @@ const handler = {
           normalizeName(url.searchParams.get("store_name")) ??
           normalizeName(url.searchParams.get("name"));
 
-        if (!storeCode || !storeName) {
-          return errorResponse("Missing store_code or store_name", 400, origin);
-        }
-
         const store = await env.nova_max_db
           .prepare("SELECT * FROM stores WHERE store_code = ? OR id = ?")
-          .bind(storeCode, storeCode)
+          .bind(storeCode ?? storeIdParam ?? "", storeIdParam ?? storeCode ?? "")
           .first<StoreRow>();
         if (!store) return errorResponse("Store not found", 404, origin);
 
-        const normalizedName = normalizeName(store.name);
-        if (!normalizedName || normalizedName !== storeName) {
-          return errorResponse("Unauthorized", 401, origin);
+        if (!storeIdParam) {
+          if (!storeCode || !storeName) {
+            return errorResponse("Missing store_code or store_name", 400, origin);
+          }
+          const normalizedName = normalizeName(store.name);
+          if (!normalizedName || normalizedName !== storeName) {
+            return errorResponse("Unauthorized", 401, origin);
+          }
         }
 
         roomName = store.id;
@@ -737,7 +937,8 @@ const handler = {
         getNormalized(body?.admin_code) ??
         getNormalized(request.headers.get("x-admin-code"));
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-      if (env.ADMIN_MASTER_CODE && !isMasterAdmin(env, adminCode)) {
+      const masterCode = await getMasterCode(env);
+      if (masterCode && !isMasterCode(adminCode, masterCode)) {
         return errorResponse("Unauthorized", 401, origin);
       }
       const name = getString(body?.name);
@@ -764,7 +965,8 @@ const handler = {
         getNormalized(url.searchParams.get("admin_code")) ??
         getNormalized(request.headers.get("x-admin-code"));
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-      if (env.ADMIN_MASTER_CODE && !isMasterAdmin(env, adminCode)) {
+      const masterCode = await getMasterCode(env);
+      if (masterCode && !isMasterCode(adminCode, masterCode)) {
         return errorResponse("Unauthorized", 401, origin);
       }
 
@@ -776,6 +978,7 @@ const handler = {
     }
 
     if (request.method === "GET" && path === "/stores/track") {
+      const storeIdParam = getString(url.searchParams.get("store_id"));
       const storeCode =
         getNormalized(url.searchParams.get("store_code")) ??
         getNormalized(url.searchParams.get("code")) ??
@@ -784,20 +987,24 @@ const handler = {
         normalizeName(url.searchParams.get("store_name")) ??
         normalizeName(url.searchParams.get("name"));
 
-      if (!storeCode || !storeName) {
-        return errorResponse("Missing store_code or store_name", 400, origin);
+      if (!storeIdParam && (!storeCode || !storeName)) {
+        return errorResponse("Missing store_id or store_code", 400, origin);
       }
 
       const store = await env.nova_max_db
-        .prepare("SELECT id, name, store_code FROM stores WHERE store_code = ? OR id = ?")
-        .bind(storeCode, storeCode)
+        .prepare(
+          "SELECT id, name, store_code FROM stores WHERE id = ? OR store_code = ?"
+        )
+        .bind(storeIdParam ?? storeCode ?? "", storeCode ?? storeIdParam ?? "")
         .first<StoreRow>();
 
       if (!store) return errorResponse("Store not found", 404, origin);
 
-      const normalizedName = normalizeName(store.name);
-      if (!normalizedName || normalizedName !== storeName) {
-        return errorResponse("Unauthorized", 401, origin);
+      if (!storeIdParam) {
+        const normalizedName = normalizeName(store.name);
+        if (!normalizedName || normalizedName !== storeName) {
+          return errorResponse("Unauthorized", 401, origin);
+        }
       }
 
       const ensured = await ensureStoreCode(env, store);
@@ -807,9 +1014,13 @@ const handler = {
         status: order.status ?? null,
         created_at: order.created_at ?? null,
         delivered_at: order.delivered_at ?? null,
+        cancelled_at: order.cancelled_at ?? null,
         customer_name: order.customer_name ?? null,
+        customer_phone: order.customer_phone ?? null,
         receiver_name: order.receiver_name ?? null,
         order_type: order.order_type ?? null,
+        cancel_reason: order.cancel_reason ?? null,
+        cancelled_by: order.cancelled_by ?? null,
       }));
 
       return jsonResponse(
@@ -835,8 +1046,9 @@ const handler = {
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
 
       let store: StoreRow | null = null;
-      if (env.ADMIN_MASTER_CODE) {
-        if (!isMasterAdmin(env, adminCode)) {
+      const masterCode = await getMasterCode(env);
+      if (masterCode) {
+        if (!isMasterCode(adminCode, masterCode)) {
           return errorResponse("Unauthorized", 401, origin);
         }
         const storeKey = getString(body?.store_id) ?? getString(body?.store_code);
@@ -879,20 +1091,22 @@ const handler = {
         getNormalized(url.searchParams.get("admin_code"));
 
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-      if (env.ADMIN_MASTER_CODE && !isMasterAdmin(env, adminCode)) {
+      const masterCode = await getMasterCode(env);
+      if (masterCode && !isMasterCode(adminCode, masterCode)) {
         return errorResponse("Unauthorized", 401, origin);
       }
 
+      const masterEnabled = Boolean(masterCode);
       const store = await env.nova_max_db
         .prepare(
-          env.ADMIN_MASTER_CODE
+          masterEnabled
             ? "SELECT * FROM stores WHERE id = ? OR store_code = ?"
             : "SELECT * FROM stores WHERE (id = ? OR store_code = ?) AND admin_code = ?"
         )
         .bind(
-          env.ADMIN_MASTER_CODE ? storeKey : storeKey,
-          env.ADMIN_MASTER_CODE ? storeKey : storeKey,
-          ...(env.ADMIN_MASTER_CODE ? [] : [adminCode])
+          masterEnabled ? storeKey : storeKey,
+          masterEnabled ? storeKey : storeKey,
+          ...(masterEnabled ? [] : [adminCode])
         )
         .first<StoreRow>();
 
@@ -923,7 +1137,8 @@ const handler = {
       const adminCode =
         getNormalized(body?.admin_code) ??
         getNormalized(request.headers.get("x-admin-code"));
-      const storeId = getString(body?.store_id);
+      const storeId =
+        getString(body?.store_id) ?? getString(body?.store_code);
       const name = getString(body?.name);
       const phone = normalizeDigits(getString(body?.phone));
 
@@ -934,12 +1149,12 @@ const handler = {
         return errorResponse("Missing driver name or phone", 400, origin);
       }
 
-      const masterEnabled = Boolean(getNormalized(env.ADMIN_MASTER_CODE));
-      const masterOk = isMasterAdmin(env, adminCode);
+      const masterCode = await getMasterCode(env);
+      const masterEnabled = Boolean(masterCode);
+      const masterOk = isMasterCode(adminCode, masterCode);
       let store: StoreRow | null = null;
 
-      if (masterEnabled) {
-        if (!masterOk) return errorResponse("Unauthorized", 401, origin);
+      if (masterEnabled && masterOk) {
         if (storeId) {
           store = await env.nova_max_db
             .prepare("SELECT * FROM stores WHERE id = ? OR store_code = ?")
@@ -948,7 +1163,7 @@ const handler = {
           if (!store) return errorResponse("Store not found", 404, origin);
         }
       } else {
-        store = await requireStore(env, storeId, adminCode);
+        store = await requireStore(env, storeId ?? null, adminCode);
         if (!store) return errorResponse("Unauthorized", 401, origin);
       }
 
@@ -1027,13 +1242,17 @@ const handler = {
       const onlineParam = getString(url.searchParams.get("online"));
 
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-      const masterEnabled = Boolean(getNormalized(env.ADMIN_MASTER_CODE));
+      const masterCode = await getMasterCode(env);
+      const masterEnabled = Boolean(masterCode);
+      const masterOk = isMasterCode(adminCode, masterCode);
+      let store: StoreRow | null = null;
       if (masterEnabled) {
-        if (!isMasterAdmin(env, adminCode)) {
-          return errorResponse("Unauthorized", 401, origin);
+        if (!masterOk) {
+          store = await requireStore(env, null, adminCode);
+          if (!store) return errorResponse("Unauthorized", 401, origin);
         }
       } else {
-        const store = await requireStore(env, null, adminCode);
+        store = await requireStore(env, null, adminCode);
         if (!store) return errorResponse("Unauthorized", 401, origin);
       }
 
@@ -1042,6 +1261,11 @@ const handler = {
       const like = `%${query}%`;
       let sql =
         "SELECT id, name, phone, status, is_active, secret_code FROM drivers WHERE (name LIKE ? OR phone LIKE ? OR secret_code LIKE ?)";
+      const params: unknown[] = [like, like, like];
+      if (store) {
+        sql += " AND store_id = ?";
+        params.push(store.id);
+      }
       if (onlineParam === "1" || onlineParam === "true") {
         sql += " AND status = 'online' AND (is_active = 1 OR is_active IS NULL)";
       }
@@ -1049,7 +1273,7 @@ const handler = {
 
       const result = await env.nova_max_db
         .prepare(sql)
-        .bind(like, like, like)
+        .bind(...params)
         .run<DriverRow>();
 
       const drivers = (result.results ?? []).map((driver) => {
@@ -1071,12 +1295,12 @@ const handler = {
         getString(url.searchParams.get("store_code"));
 
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-      const masterEnabled = Boolean(getNormalized(env.ADMIN_MASTER_CODE));
-      const masterOk = isMasterAdmin(env, adminCode);
+      const masterCode = await getMasterCode(env);
+      const masterEnabled = Boolean(masterCode);
+      const masterOk = isMasterCode(adminCode, masterCode);
       let store: StoreRow | null = null;
 
-      if (masterEnabled) {
-        if (!masterOk) return errorResponse("Unauthorized", 401, origin);
+      if (masterEnabled && masterOk) {
         if (storeKey) {
           store = await env.nova_max_db
             .prepare("SELECT * FROM stores WHERE id = ? OR store_code = ?")
@@ -1148,11 +1372,15 @@ const handler = {
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
       if (activeBool === null) return errorResponse("Missing active flag", 400, origin);
 
-      const masterEnabled = Boolean(getNormalized(env.ADMIN_MASTER_CODE));
-      const masterOk = isMasterAdmin(env, adminCode);
+      const masterCode = await getMasterCode(env);
+      const masterEnabled = Boolean(masterCode);
+      const masterOk = isMasterCode(adminCode, masterCode);
       let store: StoreRow | null = null;
       if (masterEnabled) {
-        if (!masterOk) return errorResponse("Unauthorized", 401, origin);
+        if (!masterOk) {
+          store = await requireStore(env, null, adminCode);
+          if (!store) return errorResponse("Unauthorized", 401, origin);
+        }
       } else {
         store = await requireStore(env, null, adminCode);
         if (!store) return errorResponse("Unauthorized", 401, origin);
@@ -1391,7 +1619,7 @@ const handler = {
       segments[2] === "wallet" &&
       (segments[3] === "credit" || segments[3] === "debit")
     ) {
-      const driverId = segments[1];
+      const driverKey = segments[1];
       const body = await request.json().catch(() => null);
       const adminCode =
         getString(body?.admin_code) ?? getString(request.headers.get("x-admin-code"));
@@ -1399,48 +1627,67 @@ const handler = {
       const method = getString(body?.method);
       const note = getString(body?.note);
       const type = segments[3] === "credit" ? "credit" : "debit";
+      const idempotencyKey =
+        getIdempotencyKey(body?.idempotency_key) ?? `manual:${crypto.randomUUID()}`;
+      const storeKey = getString(body?.store_id) ?? getString(body?.store_code);
+      const masterCode = await getMasterCode(env);
+      const masterOk = isMasterCode(adminCode, masterCode);
 
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
       if (!amount || amount <= 0) {
         return errorResponse("Invalid amount", 400, origin);
       }
 
-      const store = await requireStore(env, null, adminCode);
-      if (!store) return errorResponse("Unauthorized", 401, origin);
-
-      const driver = await env.nova_max_db
-        .prepare("SELECT id, wallet_balance, store_id FROM drivers WHERE id = ?")
-        .bind(driverId)
-        .first<DriverRow>();
+      const driver = await resolveDriverKey(env, driverKey);
       if (!driver) return errorResponse("Driver not found", 404, origin);
 
-      const current = typeof driver.wallet_balance === "number" ? driver.wallet_balance : 0;
-      const next = type === "credit" ? current + amount : current - amount;
-      if (next < 0) {
-        return errorResponse("Insufficient wallet balance", 400, origin);
+      let store: StoreRow | null = null;
+      if (masterOk) {
+        const effectiveStoreKey = storeKey ?? driver.store_id ?? null;
+        if (!effectiveStoreKey) {
+          return errorResponse("store_id required", 400, origin);
+        }
+        store = await env.nova_max_db
+          .prepare("SELECT * FROM stores WHERE id = ? OR store_code = ?")
+          .bind(effectiveStoreKey, effectiveStoreKey)
+          .first<StoreRow>();
+        if (!store) return errorResponse("Store not found", 404, origin);
+      } else {
+        store = await requireStore(env, storeKey ?? null, adminCode);
+        if (!store) return errorResponse("Unauthorized", 401, origin);
       }
 
-      await env.nova_max_db
-        .prepare("UPDATE drivers SET wallet_balance = ? WHERE id = ?")
-        .bind(next, driverId)
-        .run();
+      if (driver.store_id && store && driver.store_id !== store.id) {
+        return errorResponse("Driver not in store", 409, origin);
+      }
 
-      const txId = crypto.randomUUID();
-      await env.nova_max_db
-        .prepare(
-          "INSERT INTO wallet_transactions (id, driver_id, amount, type, method, note) VALUES (?, ?, ?, ?, ?, ?)"
-        )
-        .bind(txId, driverId, amount, type, method, note)
-        .run();
+      const result = await applyWalletTransaction({
+        env,
+        driverId: driver.id,
+        storeId: store.id,
+        amount,
+        type,
+        method,
+        note,
+        idempotencyKey,
+      });
+      if (!result.ok) {
+        return errorResponse(
+          result.error,
+          result.duplicate ? 409 : 400,
+          origin
+        );
+      }
 
-      if (driver.store_id) {
-        await broadcastEvent(env, driver.store_id, {
+      const broadcastStoreId = driver.store_id ?? store.id;
+      if (broadcastStoreId) {
+        await broadcastEvent(env, broadcastStoreId, {
           type: "wallet_transaction",
-          driver_id: driverId,
-          balance: next,
-          target_driver_id: driverId,
+          driver_id: driver.id,
+          balance: result.balance,
+          target_driver_id: driver.id,
           transaction: {
-            id: txId,
+            id: idempotencyKey,
             amount,
             type,
             method,
@@ -1450,7 +1697,7 @@ const handler = {
         });
       }
 
-      return jsonResponse({ ok: true, balance: next }, 200, origin);
+      return jsonResponse({ ok: true, balance: result.balance }, 200, origin);
     }
 
     if (
@@ -1491,6 +1738,65 @@ const handler = {
       return jsonResponse({ ok: true, transactions: result.results ?? [] }, 200, origin);
     }
 
+    if (
+      request.method === "GET" &&
+      segments[0] === "drivers" &&
+      segments.length === 3 &&
+      segments[2] === "ledger"
+    ) {
+      const driverId = segments[1];
+      const period = getString(url.searchParams.get("period"));
+      const driverCode =
+        getNormalized(url.searchParams.get("driver_code")) ??
+        getNormalized(url.searchParams.get("secret_code")) ??
+        getNormalized(request.headers.get("x-driver-code"));
+      if (!driverCode) return errorResponse("Missing driver_code", 400, origin);
+
+      const driver = await requireDriver(env, driverId, driverCode);
+      if (!driver) return errorResponse("Unauthorized", 401, origin);
+
+      const { format, modifier } = periodExpr(period);
+
+      const ordersResult = await env.nova_max_db
+        .prepare(
+          `SELECT strftime('${format}', datetime(COALESCE(delivered_at, created_at), '${modifier}')) AS period,
+                  COUNT(*) AS trips,
+                  SUM(COALESCE(delivery_fee, 0)) AS delivery_total,
+                  SUM(COALESCE(cash_amount, 0)) AS cash_total,
+                  SUM(COALESCE(wallet_amount, 0)) AS wallet_total
+           FROM orders
+           WHERE driver_id = ? AND status = 'delivered'
+           GROUP BY period
+           ORDER BY period DESC`
+        )
+        .bind(driverId)
+        .run();
+
+      const walletResult = await env.nova_max_db
+        .prepare(
+          `SELECT strftime('${format}', datetime(created_at, '${modifier}')) AS period,
+                  SUM(CASE WHEN type = 'credit' THEN amount ELSE 0 END) AS credits,
+                  SUM(CASE WHEN type = 'debit' THEN amount ELSE 0 END) AS debits
+           FROM wallet_transactions
+           WHERE driver_id = ?
+           GROUP BY period
+           ORDER BY period DESC`
+        )
+        .bind(driverId)
+        .run<WalletTxRow>();
+
+      return jsonResponse(
+        {
+          ok: true,
+          period: period ?? "daily",
+          orders: ordersResult.results ?? [],
+          wallet: walletResult.results ?? [],
+        },
+        200,
+        origin
+      );
+    }
+
     if (request.method === "GET" && path === "/ledger/summary") {
       const adminCode =
         getNormalized(url.searchParams.get("admin_code")) ??
@@ -1501,12 +1807,10 @@ const handler = {
         getString(url.searchParams.get("store_code"));
 
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-      const masterEnabled = Boolean(getNormalized(env.ADMIN_MASTER_CODE));
+      const masterCode = await getMasterCode(env);
+      const masterEnabled = Boolean(masterCode);
       let store: StoreRow | null = null;
-      if (masterEnabled) {
-        if (!isMasterAdmin(env, adminCode)) {
-          return errorResponse("Unauthorized", 401, origin);
-        }
+      if (masterEnabled && isMasterCode(adminCode, masterCode)) {
         if (!storeKey) {
           return errorResponse("store_id required", 400, origin);
         }
@@ -1520,11 +1824,11 @@ const handler = {
         if (!store) return errorResponse("Unauthorized", 401, origin);
       }
 
-      const format = periodExpr(period);
+      const { format, modifier } = periodExpr(period);
 
       const ordersResult = await env.nova_max_db
         .prepare(
-          `SELECT strftime('${format}', COALESCE(delivered_at, created_at)) AS period,
+          `SELECT strftime('${format}', datetime(COALESCE(delivered_at, created_at), '${modifier}')) AS period,
                   COUNT(*) AS trips,
                   SUM(COALESCE(delivery_fee, 0)) AS delivery_total,
                   SUM(COALESCE(cash_amount, 0)) AS cash_total,
@@ -1539,11 +1843,11 @@ const handler = {
 
       const walletResult = await env.nova_max_db
         .prepare(
-          `SELECT strftime('${format}', created_at) AS period,
+          `SELECT strftime('${format}', datetime(created_at, '${modifier}')) AS period,
                   SUM(CASE WHEN type = 'credit' THEN amount ELSE 0 END) AS credits,
                   SUM(CASE WHEN type = 'debit' THEN amount ELSE 0 END) AS debits
-           FROM wallet_transactions
-           WHERE driver_id IN (SELECT id FROM drivers WHERE store_id = ?)
+           FROM store_wallet_transactions
+           WHERE store_id = ?
            GROUP BY period
            ORDER BY period DESC`
         )
@@ -1573,12 +1877,10 @@ const handler = {
         getString(url.searchParams.get("store_code"));
 
       if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-      const masterEnabled = Boolean(getNormalized(env.ADMIN_MASTER_CODE));
+      const masterCode = await getMasterCode(env);
+      const masterEnabled = Boolean(masterCode);
       let store: StoreRow | null = null;
-      if (masterEnabled) {
-        if (!isMasterAdmin(env, adminCode)) {
-          return errorResponse("Unauthorized", 401, origin);
-        }
+      if (masterEnabled && isMasterCode(adminCode, masterCode)) {
         if (!storeKey) {
           return errorResponse("store_id required", 400, origin);
         }
@@ -1592,12 +1894,12 @@ const handler = {
         if (!store) return errorResponse("Unauthorized", 401, origin);
       }
 
-      const format = periodExpr(period);
+      const { format, modifier } = periodExpr(period);
       const params: unknown[] = [store.id];
       let sql =
         `SELECT d.id AS driver_id,
                 d.name AS driver_name,
-                strftime('${format}', COALESCE(o.delivered_at, o.created_at)) AS period,
+                strftime('${format}', datetime(COALESCE(o.delivered_at, o.created_at), '${modifier}')) AS period,
                 COUNT(*) AS trips,
                 SUM(COALESCE(o.delivery_fee, 0)) AS delivery_total,
                 SUM(COALESCE(o.cash_amount, 0)) AS cash_total,
@@ -1631,21 +1933,31 @@ const handler = {
       const driverId = getString(url.searchParams.get("driver_id"));
       const status = getString(url.searchParams.get("status"));
       const adminCode = getString(url.searchParams.get("admin_code"));
+      const driverCode =
+        getNormalized(url.searchParams.get("driver_code")) ??
+        getNormalized(request.headers.get("x-driver-code"));
 
-      if (getNormalized(env.ADMIN_MASTER_CODE) && storeId) {
+      if (storeId) {
         if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-        if (!isMasterAdmin(env, adminCode)) {
-          return errorResponse("Unauthorized", 401, origin);
-        }
+        const store = await requireStore(env, storeId, getNormalized(adminCode));
+        if (!store) return errorResponse("Unauthorized", 401, origin);
+        storeId = store.id;
       }
 
       if (!storeId && adminCode) {
-        if (getNormalized(env.ADMIN_MASTER_CODE)) {
+        const masterCode = await getMasterCode(env);
+        if (masterCode) {
           return errorResponse("store_id required", 400, origin);
         }
-        const store = await requireStore(env, null, adminCode);
+        const store = await requireStore(env, null, getNormalized(adminCode));
         if (!store) return errorResponse("Unauthorized", 401, origin);
         storeId = store.id;
+      }
+
+      if (driverId) {
+        if (!driverCode) return errorResponse("Missing driver_code", 400, origin);
+        const driver = await requireDriver(env, driverId, driverCode);
+        if (!driver) return errorResponse("Unauthorized", 401, origin);
       }
 
       if (!storeId && !driverId) {
@@ -1699,6 +2011,8 @@ const handler = {
         getNormalized(body?.driver_code) ??
         getNormalized(request.headers.get("x-driver-code"));
       const customerName = getString(body?.customer_name);
+      const customerPhone =
+        getNormalized(body?.customer_phone) ?? getNormalized(body?.phone);
       const customerLocation = getString(body?.customer_location_text);
       const orderType = getString(body?.order_type);
       const receiverName = getString(body?.receiver_name);
@@ -1709,8 +2023,12 @@ const handler = {
       if (!adminCode) {
         return errorResponse("Missing admin_code", 400, origin);
       }
-      if (!customerName || !customerLocation) {
-        return errorResponse("Missing customer_name or customer_location_text", 400, origin);
+      if (!customerName || !customerLocation || !customerPhone) {
+        return errorResponse(
+          "Missing customer_name, customer_phone, or customer_location_text",
+          400,
+          origin
+        );
       }
 
       const store = await requireStore(env, storeId, adminCode);
@@ -1737,6 +2055,7 @@ const handler = {
         store_code: storeCode,
         driver_id: assignedDriverId,
         customer_name: customerName,
+        customer_phone: customerPhone,
         customer_location_text: customerLocation,
         order_type: orderType,
         receiver_name: receiverName,
@@ -1751,13 +2070,14 @@ const handler = {
 
       await env.nova_max_db
         .prepare(
-          "INSERT INTO orders (id, store_id, driver_id, customer_name, customer_location_text, order_type, receiver_name, payout_method, price, delivery_fee, cash_amount, wallet_amount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO orders (id, store_id, driver_id, customer_name, customer_phone, customer_location_text, order_type, receiver_name, payout_method, price, delivery_fee, cash_amount, wallet_amount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(
           orderId,
           effectiveStoreId,
           assignedDriverId,
           customerName,
+          customerPhone,
           customerLocation,
           orderType,
           receiverName,
@@ -1799,8 +2119,11 @@ const handler = {
           order: {
             id: orderId,
             store_id: effectiveStoreId,
+            store_name: storeName,
+            store_code: storeCode,
             driver_id: assignedDriverId,
             customer_name: customerName,
+            customer_phone: customerPhone,
             customer_location_text: customerLocation,
             order_type: orderType,
             receiver_name: receiverName,
@@ -1817,6 +2140,133 @@ const handler = {
       );
     }
 
+    if (request.method === "POST" && path === "/orders/bulk") {
+      const body = await request.json().catch(() => null);
+      const adminCode =
+        getNormalized(body?.admin_code) ??
+        getNormalized(request.headers.get("x-admin-code"));
+      if (!adminCode) {
+        return errorResponse("Missing admin_code", 400, origin);
+      }
+
+      const storeKey = getString(body?.store_id) ?? getString(body?.store_code);
+      const store = await requireStore(env, storeKey, adminCode);
+      if (!store) return errorResponse("Unauthorized", 401, origin);
+
+      const ordersInput = Array.isArray(body?.orders) ? body.orders : null;
+      if (!ordersInput || ordersInput.length === 0) {
+        return errorResponse("Missing orders array", 400, origin);
+      }
+      if (ordersInput.length > 1000) {
+        return errorResponse("Too many orders", 413, origin);
+      }
+
+      const statements = [];
+      const created: Array<Record<string, unknown>> = [];
+      const now = new Date().toISOString();
+
+      for (let i = 0; i < ordersInput.length; i += 1) {
+        const item = ordersInput[i] ?? {};
+        const customerName = getString(item?.customer_name);
+        const customerPhone =
+          getNormalized(item?.customer_phone) ?? getNormalized(item?.phone);
+        const customerLocation = getString(item?.customer_location_text);
+        const orderType = getString(item?.order_type);
+        const receiverName = getString(item?.receiver_name);
+        const payoutMethod = getString(item?.payout_method) ?? "wallet";
+        const price = parseNumber(item?.price);
+        const deliveryFee = parseNumber(item?.delivery_fee);
+        const driverCode = getNormalized(item?.driver_code);
+        const driverId = getString(item?.driver_id);
+
+        if (!customerName || !customerPhone || !customerLocation) {
+          return errorResponse(`Invalid order at index ${i}`, 400, origin);
+        }
+
+        let assignedDriverId = driverId;
+        if (driverCode && !assignedDriverId) {
+          const driverByCode = await requireDriverByCode(env, driverCode);
+          if (!driverByCode) {
+            return errorResponse(`Driver not found at index ${i}`, 404, origin);
+          }
+          assignedDriverId = driverByCode.id;
+        }
+
+        const safePrice = typeof price === "number" ? price : 0;
+        const cashAmount = payoutMethod === "cash" ? safePrice : 0;
+        const walletAmount = payoutMethod === "cash" ? 0 : safePrice;
+        const orderId = crypto.randomUUID();
+
+        created.push({
+          id: orderId,
+          store_id: store.id,
+          store_name: store.name,
+          store_code: store.store_code ?? null,
+          driver_id: assignedDriverId,
+          customer_name: customerName,
+          customer_phone: customerPhone,
+          customer_location_text: customerLocation,
+          order_type: orderType,
+          receiver_name: receiverName,
+          payout_method: payoutMethod,
+          price,
+          delivery_fee: deliveryFee,
+          cash_amount: cashAmount,
+          wallet_amount: walletAmount,
+          status: "pending",
+          created_at: now,
+        });
+
+        statements.push(
+          env.nova_max_db
+            .prepare(
+              "INSERT INTO orders (id, store_id, driver_id, customer_name, customer_phone, customer_location_text, order_type, receiver_name, payout_method, price, delivery_fee, cash_amount, wallet_amount, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(
+              orderId,
+              store.id,
+              assignedDriverId,
+              customerName,
+              customerPhone,
+              customerLocation,
+              orderType,
+              receiverName,
+              payoutMethod,
+              price,
+              deliveryFee,
+              cashAmount,
+              walletAmount,
+              "pending"
+            )
+        );
+      }
+
+      await env.nova_max_db.batch(statements);
+
+      for (const order of created) {
+        await broadcastEvent(env, store.id, {
+          type: "order_created",
+          target_driver_id: (order as { driver_id?: string | null }).driver_id ?? undefined,
+          ts: now,
+          order,
+        });
+        await broadcastGlobalEvent(env, {
+          type: "order_created",
+          audience: "admin",
+          ts: now,
+          order,
+        });
+        await broadcastGlobalEvent(env, {
+          type: "order_created",
+          audience: "driver",
+          ts: now,
+          order,
+        });
+      }
+
+      return jsonResponse({ ok: true, count: created.length, orders: created }, 201, origin);
+    }
+
     if (request.method === "GET" && path === "/orders") {
       let storeId = getString(url.searchParams.get("store_id"));
       const adminCode = getNormalized(url.searchParams.get("admin_code"));
@@ -1827,20 +2277,27 @@ const handler = {
         getNormalized(url.searchParams.get("driver_code")) ??
         getNormalized(request.headers.get("x-driver-code"));
 
-      if (getNormalized(env.ADMIN_MASTER_CODE) && storeId) {
+      if (storeId) {
         if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
-        if (!isMasterAdmin(env, adminCode)) {
-          return errorResponse("Unauthorized", 401, origin);
-        }
+        const store = await requireStore(env, storeId, adminCode);
+        if (!store) return errorResponse("Unauthorized", 401, origin);
+        storeId = store.id;
       }
 
       if (!storeId && adminCode) {
-        if (getNormalized(env.ADMIN_MASTER_CODE)) {
+        const masterCode = await getMasterCode(env);
+        if (masterCode) {
           return errorResponse("store_id required", 400, origin);
         }
         const store = await requireStore(env, null, adminCode);
         if (!store) return errorResponse("Unauthorized", 401, origin);
         storeId = store.id;
+      }
+
+      if (driverId) {
+        if (!driverCode) return errorResponse("Missing driver_code", 400, origin);
+        const driver = await requireDriver(env, driverId, driverCode);
+        if (!driver) return errorResponse("Unauthorized", 401, origin);
       }
 
       if (!storeId && !adminCode && !driverId) {
@@ -1878,7 +2335,12 @@ const handler = {
         getNormalized(body?.driver_code) ??
         getNormalized(body?.secret_code) ??
         getNormalized(request.headers.get("x-driver-code"));
+      const cancelReason =
+        getString(body?.cancel_reason) ??
+        getString(body?.reason) ??
+        getString(body?.note);
       if (!driverCode) return errorResponse("Missing driver_code", 400, origin);
+      if (!cancelReason) return errorResponse("Missing cancel_reason", 400, origin);
 
       let driver: DriverRow | null = null;
       if (driverId) {
@@ -1902,8 +2364,10 @@ const handler = {
       }
 
       await env.nova_max_db
-        .prepare("UPDATE orders SET driver_id = NULL WHERE id = ?")
-        .bind(orderId)
+        .prepare(
+          "UPDATE orders SET driver_id = NULL, cancel_reason = ?, cancelled_by = ?, cancelled_at = CURRENT_TIMESTAMP WHERE id = ?"
+        )
+        .bind(cancelReason, "driver", orderId)
         .run();
 
       const ts = new Date().toISOString();
@@ -1914,6 +2378,9 @@ const handler = {
           store_id: order.store_id,
           status: "pending",
           driver_id: null,
+          cancel_reason: cancelReason,
+          cancelled_at: ts,
+          cancelled_by: "driver",
           ts,
         });
       }
@@ -1924,6 +2391,9 @@ const handler = {
         store_id: order.store_id,
         status: "pending",
         driver_id: null,
+        cancel_reason: cancelReason,
+        cancelled_at: ts,
+        cancelled_by: "driver",
         ts,
       });
       await broadcastGlobalEvent(env, {
@@ -1933,6 +2403,9 @@ const handler = {
         store_id: order.store_id,
         status: "pending",
         driver_id: null,
+        cancel_reason: cancelReason,
+        cancelled_at: ts,
+        cancelled_by: "driver",
         ts,
       });
 
@@ -1970,6 +2443,10 @@ const handler = {
       const secretCode =
         getNormalized(body?.secret_code) ??
         getNormalized(request.headers.get("x-driver-code"));
+      const cancelReason =
+        getString(body?.cancel_reason) ??
+        getString(body?.reason) ??
+        getString(body?.note);
 
       const store = await requireStore(env, storeId, adminCode);
       let driver = await requireDriver(env, driverId, secretCode);
@@ -1992,6 +2469,9 @@ const handler = {
 
       const currentStatus = order.status as OrderStatus;
       const isReopen = currentStatus === "cancelled" && nextStatus === "pending";
+      if (nextStatus === "cancelled" && !cancelReason) {
+        return errorResponse("Missing cancel_reason", 400, origin);
+      }
       if (isReopen) {
         if (!store) return errorResponse("Unauthorized", 401, origin);
         if (order.store_id && order.store_id !== store.id) {
@@ -1999,7 +2479,9 @@ const handler = {
         }
 
         await env.nova_max_db
-          .prepare("UPDATE orders SET status = ?, driver_id = NULL, delivered_at = NULL WHERE id = ?")
+          .prepare(
+            "UPDATE orders SET status = ?, driver_id = NULL, delivered_at = NULL, cancel_reason = NULL, cancelled_by = NULL, cancelled_at = NULL WHERE id = ?"
+          )
           .bind("pending", orderId)
           .run();
 
@@ -2015,6 +2497,7 @@ const handler = {
           store_code: store.store_code ?? null,
           driver_id: null,
           customer_name: refreshed?.customer_name ?? order.customer_name,
+          customer_phone: refreshed?.customer_phone ?? order.customer_phone,
           customer_location_text:
             refreshed?.customer_location_text ?? order.customer_location_text,
           order_type: refreshed?.order_type ?? order.order_type,
@@ -2036,6 +2519,9 @@ const handler = {
           status: "pending",
           driver_id: null,
           delivered_at: null,
+          cancel_reason: null,
+          cancelled_at: null,
+          cancelled_by: null,
           ts,
         });
 
@@ -2083,7 +2569,7 @@ const handler = {
       if (currentStatus === "pending" && nextStatus === "accepted") {
         const update = await env.nova_max_db
           .prepare(
-            "UPDATE orders SET status = ?, driver_id = ? WHERE id = ? AND status = 'pending' AND (driver_id IS NULL OR driver_id = ?)"
+            "UPDATE orders SET status = ?, driver_id = ?, cancel_reason = NULL, cancelled_by = NULL, cancelled_at = NULL WHERE id = ? AND status = 'pending' AND (driver_id IS NULL OR driver_id = ?)"
           )
           .bind(nextStatus, effectiveDriverId, orderId, effectiveDriverId)
           .run();
@@ -2091,6 +2577,15 @@ const handler = {
         if (update.meta.changes === 0) {
           return errorResponse("Order already assigned to another driver", 409, origin);
         }
+      } else if (nextStatus === "cancelled") {
+        const cancelledBy = driver ? "driver" : "admin";
+        const cancelledDriverId = effectiveDriverId ?? order.driver_id;
+        await env.nova_max_db
+          .prepare(
+            "UPDATE orders SET status = ?, driver_id = ?, cancel_reason = ?, cancelled_by = ?, cancelled_at = CURRENT_TIMESTAMP WHERE id = ?"
+          )
+          .bind(nextStatus, cancelledDriverId, cancelReason, cancelledBy, orderId)
+          .run();
       } else if (markDelivered) {
         await env.nova_max_db
           .prepare(
@@ -2110,31 +2605,35 @@ const handler = {
         const payoutMethod = order.payout_method ?? "wallet";
 
         if (fee > 0) {
-          await env.nova_max_db
-            .prepare(
-              "UPDATE drivers SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE id = ?"
-            )
-            .bind(fee, effectiveDriverId)
-            .run();
+          const idemKey = `delivery:${orderId}`;
+          const result = await applyWalletTransaction({
+            env,
+            driverId: effectiveDriverId,
+            storeId: order.store_id,
+            amount: fee,
+            type: "credit",
+            method: payoutMethod,
+            note: buildOrderNote(orderId, "delivered", store?.name ?? null),
+            idempotencyKey: idemKey,
+            relatedOrderId: orderId,
+          });
 
-          const txId = crypto.randomUUID();
-          await env.nova_max_db
-            .prepare(
-              "INSERT INTO wallet_transactions (id, driver_id, amount, type, method, note) VALUES (?, ?, ?, ?, ?, ?)"
-            )
-            .bind(
-              txId,
-              effectiveDriverId,
-              fee,
-              "credit",
-              payoutMethod,
-              `Order ${orderId} delivered`
-            )
-            .run();
+          if (!result.ok && !result.duplicate) {
+            return errorResponse(result.error, 400, origin);
+          }
         }
       }
 
       const ts = new Date().toISOString();
+      const cancelledAt = nextStatus === "cancelled" ? ts : order.cancelled_at;
+      const cancelReasonOut =
+        nextStatus === "cancelled" ? cancelReason : order.cancel_reason;
+      const cancelledByOut =
+        nextStatus === "cancelled"
+          ? driver
+            ? "driver"
+            : "admin"
+          : order.cancelled_by;
       if (order.store_id) {
         await broadcastEvent(env, order.store_id, {
           type: "order_status",
@@ -2144,6 +2643,9 @@ const handler = {
           driver_id: effectiveDriverId,
           target_driver_id: effectiveDriverId ?? undefined,
           delivered_at: markDelivered ? ts : order.delivered_at,
+          cancelled_at: cancelledAt ?? undefined,
+          cancel_reason: cancelReasonOut ?? undefined,
+          cancelled_by: cancelledByOut ?? undefined,
           ts,
         });
       }
@@ -2156,6 +2658,9 @@ const handler = {
         status: nextStatus,
         driver_id: effectiveDriverId,
         delivered_at: markDelivered ? ts : order.delivered_at,
+        cancelled_at: cancelledAt ?? undefined,
+        cancel_reason: cancelReasonOut ?? undefined,
+        cancelled_by: cancelledByOut ?? undefined,
         ts,
       });
 
@@ -2167,6 +2672,9 @@ const handler = {
         status: nextStatus,
         driver_id: effectiveDriverId,
         delivered_at: markDelivered ? ts : order.delivered_at,
+        cancelled_at: cancelledAt ?? undefined,
+        cancel_reason: cancelReasonOut ?? undefined,
+        cancelled_by: cancelledByOut ?? undefined,
         ts,
       });
 
