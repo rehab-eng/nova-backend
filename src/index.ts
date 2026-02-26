@@ -862,13 +862,21 @@ const handler = {
           normalizeName(url.searchParams.get("store_name")) ??
           normalizeName(url.searchParams.get("name"));
 
+        if (storeIdParam && !storeCode) {
+          return errorResponse("Missing store_code", 400, origin);
+        }
+
         const store = await env.nova_max_db
           .prepare("SELECT * FROM stores WHERE store_code = ? OR id = ?")
           .bind(storeCode ?? storeIdParam ?? "", storeIdParam ?? storeCode ?? "")
           .first<StoreRow>();
         if (!store) return errorResponse("Store not found", 404, origin);
 
-        if (!storeIdParam) {
+        if (storeIdParam) {
+          if (!storeCode || normalizeDigits(store.store_code) !== storeCode) {
+            return errorResponse("Unauthorized", 401, origin);
+          }
+        } else {
           if (!storeCode || !storeName) {
             return errorResponse("Missing store_code or store_name", 400, origin);
           }
@@ -990,6 +998,9 @@ const handler = {
       if (!storeIdParam && (!storeCode || !storeName)) {
         return errorResponse("Missing store_id or store_code", 400, origin);
       }
+      if (storeIdParam && !storeCode) {
+        return errorResponse("Missing store_code", 400, origin);
+      }
 
       const store = await env.nova_max_db
         .prepare(
@@ -1000,7 +1011,11 @@ const handler = {
 
       if (!store) return errorResponse("Store not found", 404, origin);
 
-      if (!storeIdParam) {
+      if (storeIdParam) {
+        if (!storeCode || normalizeDigits(store.store_code) !== storeCode) {
+          return errorResponse("Unauthorized", 401, origin);
+        }
+      } else {
         const normalizedName = normalizeName(store.name);
         if (!normalizedName || normalizedName !== storeName) {
           return errorResponse("Unauthorized", 401, origin);
