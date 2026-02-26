@@ -7,6 +7,7 @@ export interface Env {
   SENTRY_DSN?: string;
   SENTRY_ENVIRONMENT?: string;
   ADMIN_MASTER_CODE?: string;
+  DATA_SAFETY_LOCK?: string;
 }
 
 type OrderStatus = "pending" | "accepted" | "delivering" | "delivered" | "cancelled";
@@ -186,6 +187,12 @@ async function getMasterCode(env: Env): Promise<string | null> {
 function isMasterCode(adminCode: string | null, masterCode: string | null): boolean {
   if (!masterCode) return false;
   return normalizeAdminCode(adminCode) === masterCode;
+}
+
+function isDataSafetyLockOn(env: Env): boolean {
+  const value = getString(env.DATA_SAFETY_LOCK);
+  if (!value) return true;
+  return value !== "0";
 }
 
 
@@ -1132,6 +1139,9 @@ const handler = {
       if (!shouldPurge) {
         return errorResponse("purge=1 required", 400, origin);
       }
+      if (isDataSafetyLockOn(env)) {
+        return errorResponse("Data safety lock enabled", 403, origin);
+      }
 
       await env.nova_max_db.batch([
         env.nova_max_db
@@ -1603,6 +1613,9 @@ const handler = {
       const shouldPurge = purge === "1" || purge === "true";
 
       if (shouldPurge) {
+        if (isDataSafetyLockOn(env)) {
+          return errorResponse("Data safety lock enabled", 403, origin);
+        }
         await env.nova_max_db.batch([
           env.nova_max_db.prepare("DELETE FROM wallet_transactions WHERE driver_id = ?").bind(driverId),
           env.nova_max_db.prepare("DELETE FROM orders WHERE driver_id = ?").bind(driverId),
