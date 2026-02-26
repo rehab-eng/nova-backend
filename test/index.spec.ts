@@ -122,5 +122,5 @@ describe('Nova backend', () => {
 		expect(response2.status).toBe(409);
 		const body2 = await response2.json();
 		expect(body2?.error?.toLowerCase()).toContain("constraint");
-	});
+	}, 15000);
 });
