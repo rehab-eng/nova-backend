@@ -2291,6 +2291,8 @@ const handler = {
       const driverCode =
         getNormalized(url.searchParams.get("driver_code")) ??
         getNormalized(request.headers.get("x-driver-code"));
+      const masterCode = await getMasterCode(env);
+      const masterOk = isMasterCode(adminCode, masterCode);
 
       if (storeId) {
         if (!adminCode) return errorResponse("Missing admin_code", 400, origin);
@@ -2300,19 +2302,30 @@ const handler = {
       }
 
       if (!storeId && adminCode) {
-        const masterCode = await getMasterCode(env);
-        if (masterCode) {
+        if (masterCode && !masterOk) {
           return errorResponse("store_id required", 400, origin);
         }
-        const store = await requireStore(env, null, adminCode);
-        if (!store) return errorResponse("Unauthorized", 401, origin);
-        storeId = store.id;
+        if (!masterOk) {
+          const store = await requireStore(env, null, adminCode);
+          if (!store) return errorResponse("Unauthorized", 401, origin);
+          storeId = store.id;
+        }
       }
 
       if (driverId) {
-        if (!driverCode) return errorResponse("Missing driver_code", 400, origin);
-        const driver = await requireDriver(env, driverId, driverCode);
-        if (!driver) return errorResponse("Unauthorized", 401, origin);
+        if (!driverCode && !masterOk) {
+          return errorResponse("Missing driver_code", 400, origin);
+        }
+        if (!masterOk) {
+          const driver = await requireDriver(env, driverId, driverCode);
+          if (!driver) return errorResponse("Unauthorized", 401, origin);
+        } else {
+          const driver = await env.nova_max_db
+            .prepare("SELECT id FROM drivers WHERE id = ?")
+            .bind(driverId)
+            .first<{ id: string }>();
+          if (!driver) return errorResponse("Driver not found", 404, origin);
+        }
       }
 
       if (!storeId && !adminCode && !driverId) {
