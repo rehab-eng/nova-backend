@@ -2031,7 +2031,7 @@ const handler = {
       const customerLocation = getString(body?.customer_location_text);
       const orderType = getString(body?.order_type);
       const receiverName = getString(body?.receiver_name);
-      const payoutMethod = getString(body?.payout_method) ?? "wallet";
+      const payoutMethod = "cash";
       const price = parseNumber(body?.price);
       const deliveryFee = parseNumber(body?.delivery_fee);
 
@@ -2188,7 +2188,7 @@ const handler = {
         const customerLocation = getString(item?.customer_location_text);
         const orderType = getString(item?.order_type);
         const receiverName = getString(item?.receiver_name);
-        const payoutMethod = getString(item?.payout_method) ?? "wallet";
+        const payoutMethod = "cash";
         const price = parseNumber(item?.price);
         const deliveryFee = parseNumber(item?.delivery_fee);
         const driverCode = getNormalized(item?.driver_code);
@@ -2616,16 +2616,16 @@ const handler = {
       }
 
       if (markDelivered && effectiveDriverId) {
-        const fee = typeof order.delivery_fee === "number" ? order.delivery_fee : 0;
-        const payoutMethod = order.payout_method ?? "wallet";
+        const orderAmount = typeof order.price === "number" ? order.price : 0;
+        const payoutMethod = "cash";
 
-        if (fee > 0) {
-          const idemKey = `delivery:${orderId}`;
+        if (orderAmount > 0) {
+          const idemKey = `order:${orderId}`;
           const result = await applyWalletTransaction({
             env,
             driverId: effectiveDriverId,
             storeId: order.store_id,
-            amount: fee,
+            amount: orderAmount,
             type: "credit",
             method: payoutMethod,
             note: buildOrderNote(orderId, "delivered", store?.name ?? null),
