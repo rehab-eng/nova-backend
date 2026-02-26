@@ -582,6 +582,7 @@ export class RealtimeRoom {
   private state: DurableObjectState;
   private env: Env;
   private busyDrivers = new Set<string>();
+  private offlineTimers = new Map<string, number>();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -628,6 +629,13 @@ export class RealtimeRoom {
     const driverId = request.headers.get("X-Driver-Id");
 
     const alreadyOnline = driverId ? this.hasDriverConnection(driverId) : false;
+    if (driverId) {
+      const pending = this.offlineTimers.get(driverId);
+      if (pending) {
+        clearTimeout(pending);
+        this.offlineTimers.delete(driverId);
+      }
+    }
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -706,10 +714,17 @@ export class RealtimeRoom {
     const meta = this.getMeta(ws);
     if (!meta.driverId) return;
     const stillOnline = this.hasDriverConnection(meta.driverId, ws);
-    if (!stillOnline) {
-      await this.setDriverStatus(meta.driverId, "offline");
-      this.busyDrivers.delete(meta.driverId);
-    }
+    if (stillOnline) return;
+    if (this.offlineTimers.has(meta.driverId)) return;
+    const timer = setTimeout(async () => {
+      const online = this.hasDriverConnection(meta.driverId);
+      if (!online) {
+        await this.setDriverStatus(meta.driverId, "offline");
+        this.busyDrivers.delete(meta.driverId);
+      }
+      this.offlineTimers.delete(meta.driverId);
+    }, 5000) as unknown as number;
+    this.offlineTimers.set(meta.driverId, timer);
   }
 
   private async setDriverStatus(
